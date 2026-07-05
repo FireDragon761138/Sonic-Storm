@@ -23,9 +23,9 @@ negligible on any modern PC.
 
 1. Install [Equalizer APO](https://sourceforge.net/projects/equalizerapo/) and
    set your playback device to **7.1** in Windows Sound settings.
-2. Grab a prebuilt DLL — [SonicStorm.dll](SonicStorm/SonicStorm.dll) or
-   [SonicStormHP.dll](SonicStormHP/SonicStormHP.dll) — or build it yourself
-   (see the per-plugin READMEs).
+2. Grab a prebuilt DLL from
+   [Releases](https://github.com/FireDragon761138/Sonic-Storm/releases), or
+   build it yourself (see the per-plugin READMEs).
 3. Copy the DLL to `EqualizerAPO\VSTPlugins\` and add to your config:
    ```
    VSTPlugin: VSTPlugins\SonicStormHP.dll
