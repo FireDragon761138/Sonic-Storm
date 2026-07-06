@@ -48,6 +48,16 @@
 //         3 LFE     subwoofer-channel level                       (0..1)
 //         4 Output  master trim (0.5 == unity, 0 dB)              (0..1)
 //         5 Head    head radius 6.5..11 cm (rescales ITD/shadow)  (0..1)
+//         6 Couple  ear coupling: <0.5 over-ear, >=0.5 on-ear     (0..1)
+//
+// Ear coupling: over-ear (circumaural) leaves the pinna intact, so the model's
+// differential voicing is calibrated for it. On-ear (supra-aural) presses on
+// and flattens the OUTER pinna (helix/flange/crus), weakening exactly the
+// direction-dependent cues those structures produce -- measured supra-vs-circum
+// coupling diverges 8-15 dB above 4-5 kHz, <5 dB below 2 kHz. So on-ear mode
+// synthesizes MORE of the two outer-pinna cues (Batteau notch, flange shelf) to
+// replace what the compressed pinna no longer supplies; the deep-concha and
+// low-mid cues, and all head/torso cues, are coupling-independent and untouched.
 //
 // Build: see build_mingw.bat.  License: BSD-2-Clause.
 
@@ -58,6 +68,9 @@
 #include <algorithm>
 
 #if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX        // keep windows.h from clobbering std::min/std::max (MSVC)
+#endif
 #include <windows.h>
 #include <commctrl.h>   // trackbar (msctls_trackbar32)
 #endif
@@ -66,8 +79,16 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-static const VstInt32 kNumParams = 6;
-enum { P_SPACE = 0, P_SURR = 1, P_CENTER = 2, P_LFE = 3, P_OUT = 4, P_HEAD = 5 };
+static const VstInt32 kNumParams = 7;
+enum { P_SPACE = 0, P_SURR = 1, P_CENTER = 2, P_LFE = 3, P_OUT = 4, P_HEAD = 5, P_MODE = 6 };
+
+// Ear coupling: over-ear (0) vs on-ear (1). On-ear multiplies the two
+// outer-pinna cues so the model replaces the direction-dependent shaping a
+// compressed pinna no longer provides. Over-ear values leave the model
+// bit-identical to before this control existed.
+static inline bool   onEar(float p)        { return p >= 0.5f; }
+static const double kOnEarNotchScale  = 1.35;  // Batteau crus-notch depth
+static const double kOnEarFlangeScale = 1.30;  // rear-treble flange shelf
 
 // 7.1 channel indices (standard Windows order).
 enum { CH_FL = 0, CH_FR, CH_FC, CH_LFE, CH_BL, CH_BR, CH_SL, CH_SR };
@@ -292,6 +313,7 @@ struct SonicStormHP {
     float  params[kNumParams];
     double fs = 44100.0;
     double lastHead = -1.0;            // triggers model rebuild when knob moves
+    double lastMode = -1.0;            // triggers rebuild when ear coupling toggles
 
     SrcRing ring[kNumSrc];
 
@@ -346,11 +368,13 @@ struct SonicStormHP {
         params[P_LFE]    = 0.4f;
         params[P_OUT]    = 0.5f;   // unity
         params[P_HEAD]   = 0.5f;   // 8.75 cm -- average adult head
+        params[P_MODE]   = 0.0f;   // over-ear (calibration reference)
     }
 
     void setSampleRate(double sr) {
         fs = sr;
         lastHead = -1.0;
+        lastMode = -1.0;
         rebuildModel();
         lfeLP[0].setLowpass(fs, 120.0, 0.7071);   // LR4 = two Q=0.7071 sections
         lfeLP[1].setLowpass(fs, 120.0, 0.7071);
@@ -367,8 +391,15 @@ struct SonicStormHP {
     // at block boundaries when the Head knob moves.
     void rebuildModel() {
         double a = headRadius(params[P_HEAD]);
-        if (std::fabs(a - lastHead) < 1e-5) return;
+        double mode = onEar(params[P_MODE]) ? 1.0 : 0.0;
+        if (std::fabs(a - lastHead) < 1e-5 && mode == lastMode) return;
         lastHead = a;
+        lastMode = mode;
+
+        // On-ear boosts the two OUTER-pinna cues (see header): the earpad
+        // flattens the structures that produce them, so the model supplies more.
+        double notchScale  = (mode > 0.5) ? kOnEarNotchScale  : 1.0;
+        double flangeScale = (mode > 0.5) ? kOnEarFlangeScale : 1.0;
 
         const double earAz[2] = { -kEarAzDeg, +kEarAzDeg };
 
@@ -404,7 +435,7 @@ struct SonicStormHP {
                 // with distance from lateral so sides get no synthetic notch.
                 double fNotch = 6500.0 + 2800.0 * std::max(frontness, 0.0)
                                        -  900.0 * std::max(-frontness, 0.0);
-                double notchDb = -7.5 * std::fabs(frontness);
+                double notchDb = -7.5 * std::fabs(frontness) * notchScale;
                 if (notchDb < -0.05) notch[s][e].setPeaking(fs, fNotch, 4.5, notchDb);
                 else                 notch[s][e].setUnity();
                 // Blauert rear band (~1.25 kHz) for back sources.
@@ -416,7 +447,7 @@ struct SonicStormHP {
                 // sources (they sit near the ear axis), so the flange must
                 // overpower it -- measured HRTFs show rear sources losing
                 // 5-15 dB above ~8 kHz relative to front.
-                double shelfDb = -14.0 * std::max(-frontness, 0.0);
+                double shelfDb = -14.0 * std::max(-frontness, 0.0) * flangeScale;
                 if (shelfDb < -0.05) flange[s][e].setHighShelf(fs, 7800.0, shelfDb);
                 else                 flange[s][e].setUnity();
             }
@@ -536,10 +567,11 @@ struct SonicStormHP {
 
 // ------------------------------------------------------------- editor GUI ----
 #if defined(_WIN32)
-static VstRect g_edRect = { 0, 0, 348, 460 };
+static VstRect g_edRect = { 0, 0, 404, 460 };
 
-// Control id for the Defaults button (sliders use 100+i).
-enum { kResetId = 200 };
+// Control ids: sliders use 100+i; the Defaults button and the two ear-coupling
+// radio buttons get their own ids.
+enum { kResetId = 200, kModeOverId = 201, kModeOnId = 202 };
 
 static HINSTANCE dllInstance() {
     HMODULE h = nullptr;
@@ -550,6 +582,14 @@ static HINSTANCE dllInstance() {
 }
 
 void SonicStormHP::refreshValue(int i) {
+    if (i == P_MODE) {                 // two radio buttons, not a slider+value pair
+        bool on = onEar(params[P_MODE]);
+        if (edSlider[P_MODE]) SendMessageA(edSlider[P_MODE], BM_SETCHECK,  // Over-ear
+                                           on ? BST_UNCHECKED : BST_CHECKED, 0);
+        if (edValue[P_MODE])  SendMessageA(edValue[P_MODE],  BM_SETCHECK,  // On-ear
+                                           on ? BST_CHECKED : BST_UNCHECKED, 0);
+        return;
+    }
     if (!edValue[i]) return;
     char buf[32];
     double v = params[i];
@@ -584,9 +624,11 @@ static LRESULT CALLBACK EditorWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return 0;
     }
-    if (msg == WM_COMMAND && p && LOWORD(wp) == kResetId) {
-        p->resetDefaults();
-        return 0;
+    if (msg == WM_COMMAND && p) {
+        int id = LOWORD(wp);
+        if (id == kResetId)   { p->resetDefaults(); return 0; }
+        if (id == kModeOverId) { p->params[P_MODE] = 0.0f; p->refreshValue(P_MODE); return 0; }
+        if (id == kModeOnId)   { p->params[P_MODE] = 1.0f; p->refreshValue(P_MODE); return 0; }
     }
     if (msg == WM_CTLCOLORSTATIC) return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
     return DefWindowProcA(h, msg, wp, lp);
@@ -627,11 +669,26 @@ void SonicStormHP::openEditor(HWND parent) {
                     374, 6, 74, 22, edContainer,
                     (HMENU)(intptr_t)kResetId, inst, nullptr);
 
-    const char* names[kNumParams] = { "Space", "Surround", "Center", "LFE", "Output", "Head size" };
+    const char* names[kNumParams] = { "Space", "Surround", "Center", "LFE",
+                                      "Output", "Head size", "Ear coupling" };
     for (int i = 0; i < kNumParams; ++i) {
         int y = 40 + i * 48;
         CreateWindowExA(0, "STATIC", names[i], WS_CHILD | WS_VISIBLE,
                         16, y, 96, 20, edContainer, nullptr, inst, nullptr);
+        if (i == P_MODE) {             // mutually-exclusive pair, not a slider
+            // WS_GROUP on the first radio starts a fresh group so the two
+            // auto-radios exclude each other (and nothing above them).
+            edSlider[i] = CreateWindowExA(0, "BUTTON", "Over-ear",
+                        WS_CHILD | WS_VISIBLE | WS_GROUP | BS_AUTORADIOBUTTON,
+                        116, y - 2, 108, 24, edContainer,
+                        (HMENU)(intptr_t)kModeOverId, inst, nullptr);
+            edValue[i] = CreateWindowExA(0, "BUTTON", "On-ear",
+                        WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON,
+                        232, y - 2, 100, 24, edContainer,
+                        (HMENU)(intptr_t)kModeOnId, inst, nullptr);
+            refreshValue(i);
+            continue;
+        }
         HWND tb = CreateWindowExA(0, TRACKBAR_CLASSA, "",
                         WS_CHILD | WS_VISIBLE | TBS_HORZ | TBS_NOTICKS,
                         116, y - 2, 250, 28, edContainer,
@@ -653,9 +710,9 @@ void SonicStormHP::closeEditor() {
 void SonicStormHP::resetDefaults() {
     setDefaultParams();
     for (int i = 0; i < kNumParams; ++i) {
-        if (edSlider[i]) SendMessageA(edSlider[i], TBM_SETPOS, TRUE,
-                                      (LPARAM)(params[i] * 1000.0f));
-        refreshValue(i);
+        if (i != P_MODE && edSlider[i])
+            SendMessageA(edSlider[i], TBM_SETPOS, TRUE, (LPARAM)(params[i] * 1000.0f));
+        refreshValue(i);          // P_MODE updates its radio pair here
     }
 }
 #endif // _WIN32
@@ -736,10 +793,10 @@ static VstIntPtr dispatcher(AEffect* e, VstInt32 opcode, VstInt32 index,
         double v = p->params[index];
         if (opcode == effGetParamName) {
             // Must fit kVstMaxParamStrLen (8 bytes -> 7 chars).
-            const char* names[] = { "Space", "Surr", "Center", "LFE", "Output", "Head" };
+            const char* names[] = { "Space", "Surr", "Center", "LFE", "Output", "Head", "Couple" };
             copyStr(ptr, names[index], kMaxParamStr);
         } else if (opcode == effGetParamLabel) {
-            const char* labels[] = { "%", "%", "%", "%", "dB", "cm" };
+            const char* labels[] = { "%", "%", "%", "%", "dB", "cm", "" };
             copyStr(ptr, labels[index], kMaxParamStr);
         } else { // display
             if (index == P_OUT) {
@@ -748,6 +805,8 @@ static VstIntPtr dispatcher(AEffect* e, VstInt32 opcode, VstInt32 index,
                 else              std::snprintf(buf, sizeof buf, "%+.1f", 20.0 * std::log10(gain));
             } else if (index == P_HEAD) {
                 std::snprintf(buf, sizeof buf, "%.1f", headRadius((float)v) * 100.0);
+            } else if (index == P_MODE) {
+                std::snprintf(buf, sizeof buf, onEar((float)v) ? "On" : "Over");
             } else {
                 std::snprintf(buf, sizeof buf, "%.0f", v * 100.0);
             }
