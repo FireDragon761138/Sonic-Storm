@@ -29,6 +29,7 @@
 #include <cstring>
 #include <cstdio>
 #include <algorithm>
+#include <immintrin.h>
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -171,6 +172,13 @@ struct SonicStorm {
 
     template <typename T>
     void run(T** in, T** out, VstInt32 n) {
+        // Flush subnormals to zero: the recursive canceller keeps recirculating
+        // an exponentially decaying tail after the input goes silent, so its
+        // delay lines and one-poles would otherwise sit in denormal range
+        // stalling the FPU's fast path indefinitely.
+        _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
+        _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
+
         // Safe per-channel accessors (tolerate a host that hands us < 8 buffers).
         auto rd = [&](int c, VstInt32 i) -> double {
             return in[c] ? (double)in[c][i] : 0.0;
