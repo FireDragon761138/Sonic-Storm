@@ -329,16 +329,23 @@ struct SonicStormHP {
     void openEditor(HWND parent);
     void closeEditor();
     void refreshValue(int i);
+    void resetDefaults();      // Defaults button: restore params + sync UI
 #endif
 
     SonicStormHP() {
+        setDefaultParams();
+        setSampleRate(44100.0);
+    }
+
+    // Factory defaults in one place so the editor's Defaults button and the
+    // constructor can't drift apart.
+    void setDefaultParams() {
         params[P_SPACE]  = 0.5f;
         params[P_SURR]   = 0.6f;
         params[P_CENTER] = 0.6f;
         params[P_LFE]    = 0.4f;
         params[P_OUT]    = 0.5f;   // unity
         params[P_HEAD]   = 0.5f;   // 8.75 cm -- average adult head
-        setSampleRate(44100.0);
     }
 
     void setSampleRate(double sr) {
@@ -531,6 +538,9 @@ struct SonicStormHP {
 #if defined(_WIN32)
 static VstRect g_edRect = { 0, 0, 348, 460 };
 
+// Control id for the Defaults button (sliders use 100+i).
+enum { kResetId = 200 };
+
 static HINSTANCE dllInstance() {
     HMODULE h = nullptr;
     GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
@@ -574,6 +584,10 @@ static LRESULT CALLBACK EditorWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return 0;
     }
+    if (msg == WM_COMMAND && p && LOWORD(wp) == kResetId) {
+        p->resetDefaults();
+        return 0;
+    }
     if (msg == WM_CTLCOLORSTATIC) return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
     return DefWindowProcA(h, msg, wp, lp);
 }
@@ -605,7 +619,13 @@ void SonicStormHP::openEditor(HWND parent) {
 
     CreateWindowExA(0, "STATIC", "SonicStorm HP  -  7.1 to binaural",
                     WS_CHILD | WS_VISIBLE,
-                    16, 8, 420, 18, edContainer, nullptr, inst, nullptr);
+                    16, 8, 300, 18, edContainer, nullptr, inst, nullptr);
+
+    // Defaults button, tucked into the empty header space (no extra height).
+    CreateWindowExA(0, "BUTTON", "Defaults",
+                    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                    374, 6, 74, 22, edContainer,
+                    (HMENU)(intptr_t)kResetId, inst, nullptr);
 
     const char* names[kNumParams] = { "Space", "Surround", "Center", "LFE", "Output", "Head size" };
     for (int i = 0; i < kNumParams; ++i) {
@@ -628,6 +648,15 @@ void SonicStormHP::openEditor(HWND parent) {
 void SonicStormHP::closeEditor() {
     if (edContainer) { DestroyWindow(edContainer); edContainer = nullptr; }
     for (int i = 0; i < kNumParams; ++i) { edSlider[i] = nullptr; edValue[i] = nullptr; }
+}
+
+void SonicStormHP::resetDefaults() {
+    setDefaultParams();
+    for (int i = 0; i < kNumParams; ++i) {
+        if (edSlider[i]) SendMessageA(edSlider[i], TBM_SETPOS, TRUE,
+                                      (LPARAM)(params[i] * 1000.0f));
+        refreshValue(i);
+    }
 }
 #endif // _WIN32
 
