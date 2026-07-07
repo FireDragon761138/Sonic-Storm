@@ -37,7 +37,9 @@
 //
 // LFE is lowpassed and fed diotically. Everything is feedforward -- stable by
 // construction. A Head knob (6.5..11 cm radius) rescales all ITDs and shadow
-// filters to personalize the fit.
+// filters to personalize the fit. The fold-down runs -10.5 dB of fixed
+// headroom (see kFoldHeadroom) so correlated multichannel bass doesn't park
+// the output soft clipper in constant duty; the clipper is a peak safety net.
 //
 // Channel order is standard Windows 7.1 (WAVEFORMATEXTENSIBLE / KSAUDIO):
 //   0 FL  1 FR  2 FC  3 LFE  4 BL  5 BR  6 SL  7 SR
@@ -124,6 +126,14 @@ static inline double gSurr  (float p) { return 1.40 * (double)p; }
 static inline double gCenter(float p) { return 1.40 * (double)p; }
 static inline double gLfe   (float p) { return 2.00 * (double)p; }
 static inline double gOut   (float p) { return 2.00 * (double)p; }   // 0.5 -> unity
+
+// Fixed fold-down headroom (-10.5 dB). Binaural rendering feeds BOTH channels
+// to EACH ear at unity below the head-shadow corner, so correlated bass sums:
+// +7 dB on plain stereo, ~+15 dB on a full 7.1 feed at default knobs
+// (measured). Without this the soft clipper runs in constant duty on loud
+// content and the bass distorts (plus heavy IMD on everything above it).
+// The Output knob's dB readout stays knob-relative (0.5 = 0 dB reference).
+static const double kFoldHeadroom = 0.30;
 static inline double headRadius(float p) { return 0.065 + 0.045 * (double)p; } // 6.5..11 cm
 
 // ------------------------------------------------------------- primitives ----
@@ -557,8 +567,8 @@ struct SonicStormHP {
             earL += 0.7071 * lfe;
             earR += 0.7071 * lfe;
 
-            if (out[0]) out[0][i] = (T)softclip(earL * outG);
-            if (out[1]) out[1][i] = (T)softclip(earR * outG);
+            if (out[0]) out[0][i] = (T)softclip(earL * kFoldHeadroom * outG);
+            if (out[1]) out[1][i] = (T)softclip(earR * kFoldHeadroom * outG);
             for (int c = 2; c < effect.numOutputs; ++c)
                 if (out[c]) out[c][i] = (T)0;
         }
