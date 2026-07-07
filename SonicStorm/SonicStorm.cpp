@@ -11,7 +11,12 @@
 // used to make sounds appear BESIDE and BEHIND the listener from only two
 // front speakers.
 // Center (dialog) and LFE (sub) bypass the canceller so speech stays anchored
-// and bass stays solid; a soft clipper keeps the 8->2 sum from clipping the DAC.
+// and bass stays solid. The LFE is bass-managed: Linkwitz-Riley 4th-order
+// lowpass at 120 Hz with a phase-matched 2nd-order allpass on the main bus, so
+// correlated bass in the two paths sums coherently (no crossover suckout).
+// The fold-down runs -6 dB of fixed headroom: correlated bass across a 7.1
+// explosion sums to ~+9 dB at default knobs, which would otherwise park the
+// soft clipper in constant duty. The clipper stays as a peak safety net.
 //
 // Channel order is standard Windows 7.1 (WAVEFORMATEXTENSIBLE / KSAUDIO):
 //   0 FL  1 FR  2 FC  3 LFE  4 BL  5 BR  6 SL  7 SR
@@ -59,6 +64,47 @@ struct OnePoleLP {
     void reset() { z = 0.0; }
 };
 
+// RBJ biquad (lowpass / allpass), coefficients in double. Same voicing as the
+// bass-management pair in SonicStorm HP.
+struct Biquad {
+    double b0 = 1, b1 = 0, b2 = 0, a1 = 0, a2 = 0;
+    double z1 = 0, z2 = 0;
+    void reset() { z1 = z2 = 0; }
+    void setUnity() { b0 = 1; b1 = b2 = a1 = a2 = 0; }
+
+    // RBJ lowpass (cascade two with Q=0.7071 for an LR4, 24 dB/oct).
+    void setLowpass(double fs, double fc, double Q) {
+        if (fc > fs * 0.45) { setUnity(); return; }
+        double w0 = 2.0 * M_PI * fc / fs, cs = std::cos(w0), sn = std::sin(w0);
+        double alpha = sn / (2.0 * Q);
+        double a0 = 1.0 + alpha;
+        b0 = ((1.0 - cs) * 0.5) / a0;
+        b1 = ( 1.0 - cs) / a0;
+        b2 = ((1.0 - cs) * 0.5) / a0;
+        a1 = (-2.0 * cs) / a0;
+        a2 = ( 1.0 - alpha) / a0;
+    }
+    // RBJ 2nd-order allpass: flat magnitude, phase response identical to an
+    // LR4 lowpass at the same fc/Q -- the standard bass-management phase match.
+    void setAllpass(double fs, double fc, double Q) {
+        if (fc > fs * 0.45) { setUnity(); return; }
+        double w0 = 2.0 * M_PI * fc / fs, cs = std::cos(w0), sn = std::sin(w0);
+        double alpha = sn / (2.0 * Q);
+        double a0 = 1.0 + alpha;
+        b0 = (1.0 - alpha) / a0;
+        b1 = (-2.0 * cs) / a0;
+        b2 = (1.0 + alpha) / a0;
+        a1 = (-2.0 * cs) / a0;
+        a2 = (1.0 - alpha) / a0;
+    }
+    inline double process(double x) {
+        double y = b0 * x + z1;
+        z1 = b1 * x - a1 * y + z2;
+        z2 = b2 * x - a2 * y;
+        return y;
+    }
+};
+
 // Power-of-two circular delay line (holds the canceller's fed-back outputs).
 struct Delay {
     static const int SZ = 512, MASK = 511;
@@ -96,6 +142,12 @@ static inline double gCenter(float p) { return 1.40 * (double)p; }
 static inline double gLfe   (float p) { return 2.00 * (double)p; }
 static inline double gOut   (float p) { return 2.00 * (double)p; }   // 0.5 -> 1.0 (0 dB)
 
+// Fixed fold-down headroom (-6 dB). Correlated bass across a full 7.1 feed
+// sums to ~+9 dB at default knobs (measured); without this the soft clipper
+// runs in constant duty on loud multichannel content and the bass distorts.
+// The Output knob's dB readout stays knob-relative (0.5 = 0 dB reference).
+static const double kFoldHeadroom = 0.5;
+
 // ---------------------------------------------------------------- Plugin ----
 struct SonicStorm {
     AEffect effect;
@@ -115,7 +167,16 @@ struct SonicStorm {
     OnePoleLP xfBassL, xfBassR;        // bass-protect split in the crossfeed path
     OnePoleLP xfShadowL, xfShadowR;    // head-shadow lowpass in the crossfeed path
     OnePoleLP darkBL, darkBR;          // rear-channel darkening
-    OnePoleLP lfeLP;                   // keep LFE to the sub band
+
+    // LFE path: proper bass management (same arrangement as SonicStorm HP).
+    // Linkwitz-Riley 4th-order lowpass at 120 Hz (two cascaded Q=0.7071
+    // biquads) on the LFE, and a matching 2nd-order allpass on the main bus.
+    // LR4-LP and AP2 share an identical phase response, so correlated bass in
+    // the two paths sums coherently at every frequency -- steep junk rejection
+    // with no crossover suckout. The allpass is identical for both channels,
+    // so the canceller's stereo image is untouched.
+    Biquad lfeLP[2];
+    Biquad mainAP[2];      // [0] = L bus, [1] = R bus
 
     Smooth smG, smSurr, smCen, smLfe, smOut;
 
@@ -153,7 +214,10 @@ struct SonicStorm {
         xfBassL.setCutoff(fs, kBassProtect);  xfBassR.setCutoff(fs, kBassProtect);
         xfShadowL.setCutoff(fs, kHeadShadow); xfShadowR.setCutoff(fs, kHeadShadow);
         darkBL.setCutoff(fs, kRearDarken);    darkBR.setCutoff(fs, kRearDarken);
-        lfeLP.setCutoff(fs, 120.0);
+        lfeLP[0].setLowpass(fs, 120.0, 0.7071);   // LR4 = two Q=0.7071 sections
+        lfeLP[1].setLowpass(fs, 120.0, 0.7071);
+        mainAP[0].setAllpass(fs, 120.0, 0.7071);  // phase-match for the mains
+        mainAP[1].setAllpass(fs, 120.0, 0.7071);
 
         smG.init  (fs, 30.0, gWidth (params[P_WIDTH]));
         smSurr.init(fs, 30.0, gSurr (params[P_SURR]));
@@ -167,7 +231,8 @@ struct SonicStorm {
         xfBassL.reset(); xfBassR.reset();
         xfShadowL.reset(); xfShadowR.reset();
         darkBL.reset(); darkBR.reset();
-        lfeLP.reset();
+        lfeLP[0].reset(); lfeLP[1].reset();
+        mainAP[0].reset(); mainAP[1].reset();
     }
 
     template <typename T>
@@ -226,10 +291,14 @@ struct SonicStorm {
             yL *= mk; yR *= mk;
 
             // ---- direct bus: center + LFE bypass the canceller ----
-            double lfeF = lfe * lfeLP.process(lf);
+            // Bass management: allpass the mains (phase match), LR4 the LFE,
+            // then sum -- coherent at all frequencies.
+            double lfeF = lfe * lfeLP[1].process(lfeLP[0].process(lf));
             double cenS = cen * fc * 0.7071;
-            double oL = (yL + cenS + 0.7071 * lfeF) * outG;
-            double oR = (yR + cenS + 0.7071 * lfeF) * outG;
+            double busOutL = mainAP[0].process(yL + cenS);
+            double busOutR = mainAP[1].process(yR + cenS);
+            double oL = (busOutL + 0.7071 * lfeF) * kFoldHeadroom * outG;
+            double oR = (busOutR + 0.7071 * lfeF) * kFoldHeadroom * outG;
 
             if (out[0]) out[0][i] = (T)softclip(oL);
             if (out[1]) out[1][i] = (T)softclip(oR);
