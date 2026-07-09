@@ -15,11 +15,22 @@ convolution noise, and every cue scales to *your* head via the Head knob.
 | Torso | "Snowman" shoulder-reflection tap (0.38 ms, lowpassed) | Body realism |
 | Room | Image-source model: 4 wall reflections **per source**, each binauralized at its own incidence angle | Externalization (out-of-head) |
 
-**Over-ear voicing:** your own pinna is still in the acoustic path with
-circumaural headphones, so the model synthesizes only *direction-dependent*
+**Differential voicing:** your own pinna is still in the acoustic path with
+over-ear / on-ear headphones, so the model synthesizes only *direction-dependent*
 spectral shapes referenced to lateral incidence — never absolute ear
 colorations (your ear supplies the concha/canal gain itself). Side channels
 pass essentially uncolored; fronts and backs get their differential cues.
+
+**Ear coupling (Over-ear / On-ear):** over-ear (circumaural) leaves the pinna
+intact and is the calibration reference. On-ear (supra-aural) presses on and
+flattens the *outer* pinna — the helix, flange, and crus ridges — weakening the
+direction-dependent cues those structures produce (measured supra-vs-circum
+coupling diverges 8–15 dB above 4–5 kHz, but < 5 dB below 2 kHz). So **On-ear**
+mode deepens the two outer-pinna cues (the Batteau notch and the rear-flange
+shelf) to replace what the compressed pinna no longer supplies; the deep-concha
+and low-mid cues, and every head/torso cue (ITD, shadow, shoulder), are
+coupling-independent and left untouched. Over-ear is bit-identical to before
+this control existed.
 
 Everything is feedforward — unconditionally stable. Double precision
 throughout. Center stays *exactly* centered (the virtual room is x-symmetric).
@@ -28,8 +39,11 @@ LFE gets proper bass management: a Linkwitz-Riley 4th-order lowpass at 120 Hz
 mains bus — LR4-LP and AP2 share an identical phase response, so correlated
 bass in the two paths sums coherently at every frequency (no crossover notch).
 The allpass is identical for both ears, so interaural cues are untouched.
-LFE is fed diotically. A soft-clipper
-keeps the 8→2 fold under 1.0. Latency: 4 samples (sinc-kernel causality).
+LFE is fed diotically. The fold-down runs **10.5 dB of built-in headroom**
+(binaural rendering feeds both channels to each ear, so correlated bass sums
++7 dB on stereo and ~+15 dB on a full 7.1 feed — without headroom that parks
+the soft-clipper in constant duty and distorts). A soft-clipper keeps peaks
+under 1.0 as a safety net. Latency: 4 samples (sinc-kernel causality).
 
 Channel order is standard Windows 7.1: `FL FR FC LFE BL BR SL SR`
 (virtual speakers at ±30°, 0°, ±140°, ±100°).
@@ -42,8 +56,13 @@ Channel order is standard Windows 7.1: `FL FR FC LFE BL BR SL SR`
 | Surround | Side + back channel level | 60% |
 | Center | Center / dialog level | 60% |
 | LFE | Subwoofer-channel level | 40% |
-| Output | Master trim (50% = unity / 0 dB) | 0 dB |
+| Output | Master trim (50% = 0 dB reference) | 0 dB |
 | Head size | Head radius 6.5–11 cm; rescales every ITD and shadow filter | 8.8 cm |
+| Ear coupling | Over-ear (circumaural) or On-ear (supra-aural); On-ear boosts the outer-pinna cues | Over-ear |
+
+> **Gain staging note:** because of the built-in 10.5 dB fold-down headroom,
+> Output at 50% plays ~10.5 dB quieter than the raw input. Make the level up
+> with your system volume, not the Output knob, to keep the headroom.
 
 **Tuning tip:** play something with a hard-panned rear sound. Adjust **Head
 size** until rear-side sounds sit at a stable point behind your shoulder
