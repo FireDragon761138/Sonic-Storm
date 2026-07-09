@@ -180,6 +180,15 @@ struct SonicStorm {
 
     Smooth smG, smSurr, smCen, smLfe, smOut;
 
+    // EXPERIMENTAL: transparent stereo detection. When BL/BR/SL/SR/FC are all
+    // exactly zero (pure stereo content on a 7.1 endpoint) the surround/center
+    // path -- the two rear-darkening one-poles and the surround mix -- produces
+    // nothing, so we skip it. Exact-zero test only; a short drain window lets the
+    // darkening filters settle to zero before we freeze them, so the fast path is
+    // bit-identical to the full path. The canceller and LFE always run.
+    int surrSilent = 0;    // samples since surround/center last carried signal
+    int gDrainSurr = 0;    // drain window (rear-darkening one-pole settling)
+
 #if defined(_WIN32)
     HWND edContainer = nullptr;
     HWND edSlider[kNumParams] = { nullptr, nullptr, nullptr, nullptr, nullptr };
@@ -214,6 +223,9 @@ struct SonicStorm {
         xfBassL.setCutoff(fs, kBassProtect);  xfBassR.setCutoff(fs, kBassProtect);
         xfShadowL.setCutoff(fs, kHeadShadow); xfShadowR.setCutoff(fs, kHeadShadow);
         darkBL.setCutoff(fs, kRearDarken);    darkBR.setCutoff(fs, kRearDarken);
+        // Drain window: the rear-darkening one-poles (5.5 kHz) settle in a few
+        // dozen samples; 12 ms is a generous, safe margin before we freeze them.
+        gDrainSurr = (int)std::lround(fs * 0.012);
         lfeLP[0].setLowpass(fs, 120.0, 0.7071);   // LR4 = two Q=0.7071 sections
         lfeLP[1].setLowpass(fs, 120.0, 0.7071);
         mainAP[0].setAllpass(fs, 120.0, 0.7071);  // phase-match for the mains
@@ -231,6 +243,7 @@ struct SonicStorm {
         xfBassL.reset(); xfBassR.reset();
         xfShadowL.reset(); xfShadowR.reset();
         darkBL.reset(); darkBR.reset();
+        surrSilent = gDrainSurr + 1;      // start in the fast path until surround arrives
         lfeLP[0].reset(); lfeLP[1].reset();
         mainAP[0].reset(); mainAP[1].reset();
     }
@@ -249,7 +262,23 @@ struct SonicStorm {
             return in[c] ? (double)in[c][i] : 0.0;
         };
 
+        // EXPERIMENTAL stereo detection: does any surround/center channel carry a
+        // nonzero sample this block? Exact-zero test only. If not (and the
+        // darkening filters have drained), the fast path below skips the whole
+        // surround/center mix -- bit-identically, since it would produce zero.
+        auto anyNonzero = [&](int c) -> bool {
+            if (!in[c]) return false;
+            for (VstInt32 i = 0; i < n; ++i) if (in[c][i] != (T)0) return true;
+            return false;
+        };
+        bool surrNZ = anyNonzero(CH_BL) || anyNonzero(CH_BR) ||
+                      anyNonzero(CH_SL) || anyNonzero(CH_SR) || anyNonzero(CH_FC);
+        if (surrNZ) surrSilent = 0;
+        bool fast = !surrNZ && (surrSilent >= gDrainSurr);
+
         for (VstInt32 i = 0; i < n; ++i) {
+            // All smoothers advance every sample in both paths, so the canceller
+            // state stays bit-identical to the never-gated version.
             double g    = smG.next  (gWidth (params[P_WIDTH]));
             double surr = smSurr.next(gSurr (params[P_SURR]));
             double cen  = smCen.next (gCenter(params[P_CENTER]));
@@ -257,20 +286,29 @@ struct SonicStorm {
             double outG = smOut.next (gOut  (params[P_OUT]));
 
             double fl = rd(CH_FL, i),  fr = rd(CH_FR, i);
-            double fc = rd(CH_FC, i),  lf = rd(CH_LFE, i);
-            double bl = rd(CH_BL, i),  br = rd(CH_BR, i);
-            double sl = rd(CH_SL, i),  sr = rd(CH_SR, i);
+            double lf = rd(CH_LFE, i);
 
-            // Rear channels are darkened (duller = "behind you" cue).
-            double bld = 0.4 * bl + 0.6 * darkBL.process(bl);
-            double brd = 0.4 * br + 0.6 * darkBR.process(br);
-
-            // Spatial bus: place each source in the stereo "ear" field.
-            // Fronts keep a little opposite-side bleed (0.30) so the canceller
-            // has something to widen; sides are fully lateral; backs mostly
-            // lateral with a touch of the far side.
-            double busL = fl + 0.30 * fr + surr * (sl + 0.95 * bld + 0.10 * brd);
-            double busR = fr + 0.30 * fl + surr * (sr + 0.95 * brd + 0.10 * bld);
+            double busL, busR, cenS;
+            if (fast) {
+                // Pure stereo: surround/center are zero, darkening filters drained.
+                busL = fl + 0.30 * fr;
+                busR = fr + 0.30 * fl;
+                cenS = 0.0;
+            } else {
+                double fc = rd(CH_FC, i);
+                double bl = rd(CH_BL, i),  br = rd(CH_BR, i);
+                double sl = rd(CH_SL, i),  sr = rd(CH_SR, i);
+                // Rear channels are darkened (duller = "behind you" cue).
+                double bld = 0.4 * bl + 0.6 * darkBL.process(bl);
+                double brd = 0.4 * br + 0.6 * darkBR.process(br);
+                // Spatial bus: place each source in the stereo "ear" field.
+                // Fronts keep a little opposite-side bleed (0.30) so the canceller
+                // has something to widen; sides are fully lateral; backs mostly
+                // lateral with a touch of the far side.
+                busL = fl + 0.30 * fr + surr * (sl + 0.95 * bld + 0.10 * brd);
+                busR = fr + 0.30 * fl + surr * (sr + 0.95 * brd + 0.10 * bld);
+                cenS = cen * fc * 0.7071;
+            }
 
             // ---- recursive crosstalk canceller (the out-of-speaker magic) ----
             // Read each channel's own past output, delayed; band-limit it
@@ -294,7 +332,6 @@ struct SonicStorm {
             // Bass management: allpass the mains (phase match), LR4 the LFE,
             // then sum -- coherent at all frequencies.
             double lfeF = lfe * lfeLP[1].process(lfeLP[0].process(lf));
-            double cenS = cen * fc * 0.7071;
             double busOutL = mainAP[0].process(yL + cenS);
             double busOutR = mainAP[1].process(yR + cenS);
             double oL = (busOutL + 0.7071 * lfeF) * kFoldHeadroom * outG;
@@ -308,6 +345,10 @@ struct SonicStorm {
             for (int c = 2; c < effect.numOutputs; ++c)
                 if (out[c]) out[c][i] = (T)0;
         }
+
+        // Advance the silence counter for blocks whose surround stayed quiet, so
+        // the fast path engages only after the darkening filters have drained.
+        if (!surrNZ && surrSilent < gDrainSurr + n) surrSilent += n;
     }
 };
 

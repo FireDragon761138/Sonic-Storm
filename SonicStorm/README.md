@@ -21,7 +21,10 @@ LFE ──────► sub lowpass, centered ──────────�
   themselves — the signature of 90s 3D-audio hardware. Each channel's own
   delayed, band-limited output is subtracted from the opposite channel.
 - **Center + LFE bypass the canceller** so dialog stays anchored and bass stays
-  solid and mono-safe.
+  solid and mono-safe. The LFE is properly bass-managed: a Linkwitz-Riley
+  4th-order lowpass at 120 Hz (24 dB/oct), with a phase-matched 2nd-order
+  allpass on the main bus so correlated bass sums coherently (no crossover
+  suckout).
 - **Bass-protect + head-shadow filters** keep the canceller's crossfeed gain
   below unity, so it is unconditionally stable.
 - **Rear channels are darkened** (duller = "behind you"), a cheap front/back cue.
@@ -37,7 +40,13 @@ Channel order is standard Windows 7.1: `FL FR FC LFE BL BR SL SR`.
 | Surround | Level of the side + back channels                        | 60% |
 | Center   | Center / dialog level                                    | 60% |
 | LFE      | Subwoofer level                                          | 40% |
-| Output   | Master trim (50% = unity / 0 dB)                         | 0 dB |
+| Output   | Master trim (50% = 0 dB reference)                       | 0 dB |
+
+> **Gain staging note:** the fold-down runs **6 dB of built-in headroom** (a
+> full 7.1 feed of correlated bass sums to ~+9 dB, which would otherwise drive
+> the soft clipper constantly). Output at 50% therefore plays ~6 dB quieter
+> than the raw input — make it up with your system volume, not the Output knob,
+> to keep the headroom.
 
 ## Build
 
