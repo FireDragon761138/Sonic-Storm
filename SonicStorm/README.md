@@ -1,4 +1,15 @@
-# SonicStorm ⚡ — 7.1 → 2.0 retro-90s 3D virtualizer (VST2, 64-bit)
+# SonicStorm ⚡ — 7.1 → 2.0 retro-90s 3D virtualizer (VST2, 64-bit) — EXPERIMENTAL
+
+> **Experimental build.** Identical sound to stock SonicStorm, plus a
+> **transparent stereo-detection** optimization: when the surround/center
+> channels are exactly silent (pure stereo on a 7.1 endpoint), the surround
+> path — the two rear-darkening filters and the surround mix — is skipped.
+> It is **bit-for-bit identical** to the reference (verified 0.0 difference,
+> including silence transitions), so it changes nothing you can hear. The
+> payoff is modest here (~5–18% on stereo content): SonicStorm is already very
+> light (a stereo-bus canceller, not per-source rendering), so there isn't much
+> per-channel work to skip. The technique is the same one that gives the
+> headphone build (SonicStorm HP) a ~4× stereo speedup, where it matters more.
 
 A lightweight surround-to-stereo virtualizer for **Equalizer APO**. It takes raw
 Windows **7.1** and folds it into a single stereo pair for **two real speakers**,
@@ -28,7 +39,11 @@ LFE ──────► sub lowpass, centered ──────────�
 - **Bass-protect + head-shadow filters** keep the canceller's crossfeed gain
   below unity, so it is unconditionally stable.
 - **Rear channels are darkened** (duller = "behind you"), a cheap front/back cue.
-- Fed **pure stereo** (only FL/FR), SonicStorm becomes a plain retro stereo widener.
+- Fed **pure stereo** (only FL/FR), SonicStorm becomes a plain retro stereo
+  widener — and this build **detects that automatically** (exact-zero test on
+  BL/BR/SL/SR/FC) to skip the idle surround path, after a short drain window so
+  the darkening filters settle first. The crosstalk canceller and LFE bass
+  management always run.
 
 Channel order is standard Windows 7.1: `FL FR FC LFE BL BR SL SR`.
 
@@ -56,6 +71,11 @@ Needs WinLibs MinGW-w64 g++ on PATH (`winget install BrechtSanders.WinLibs.POSIX
 build_mingw.bat          REM -> SonicStorm.dll
 g++ -O2 -o test_host.exe test_host.cpp && test_host.exe   REM optional self-test
 ```
+
+This experimental folder ships two binaries — `SonicStorm.dll` (baseline
+x86-64) and `SonicStorm_AVX2.dll` (AVX2/FMA, 2013+ CPUs) — plus
+`SonicStorm_ref.dll`, the stock build kept alongside for the transparency
+diff. All three sound identical; the AVX2 build is bit-equivalent to baseline.
 
 ## Install (Equalizer APO)
 
