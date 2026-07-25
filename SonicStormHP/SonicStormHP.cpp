@@ -70,6 +70,7 @@
 #include <algorithm>
 #include <xmmintrin.h>   // FTZ (flush-to-zero)
 #include <pmmintrin.h>   // DAZ (denormals-are-zero)
+#include <immintrin.h>   // SSE2/FMA lane pairing for the per-ear filters
 
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -227,6 +228,81 @@ struct Biquad {
     }
 };
 
+// ---- SSE2 lane pairing -------------------------------------------------
+// The per-source filters come in independent L/R pairs (same input topology,
+// per-ear state), so each pair folds into the two lanes of one __m128d update
+// at half the instruction count. Each lane performs the IDENTICAL arithmetic
+// to the scalar filter, in the identical order, so the output is bit-exact --
+// lanes never mix (all ops are element-wise), which is also why imaging cannot
+// be touched by construction.
+//
+// The one thing that varies per build is FMA contraction: the AVX2 build
+// (-O3 -mavx2 -mfma) contracts the scalar expressions to FMA, the x64 build
+// (-O2) does not. Each paired primitive therefore carries both paths, and the
+// FMA associations below are the ones g++ actually emits for the scalar code
+// (read from the disassembly, then verified EXACT 0 against the scalar build):
+//   biquad   y  = fmadd(b0,x,z1)
+//            z1 = add(fmsub(b1,x, mul(a1,y)), z2)
+//            z2 = fmsub(b2,x, mul(a2,y))
+//   shadow   y  = fnmadd(a1,y1, fmadd(b0,x, mul(b1,x1)))
+//   one-pole z  = fmadd(a, x-z, z)
+
+static inline double lane0(__m128d v) { return _mm_cvtsd_f64(v); }
+static inline double lane1(__m128d v) { return _mm_cvtsd_f64(_mm_unpackhi_pd(v, v)); }
+// a*b + c with the build's own contraction (used for the shoulder combine).
+static inline __m128d madd2(__m128d a, __m128d b, __m128d c) {
+#if defined(__FMA__)
+    return _mm_fmadd_pd(a, b, c);
+#else
+    return _mm_add_pd(_mm_mul_pd(a, b), c);
+#endif
+}
+
+// Two independent DF2T biquad lanes; pack() copies coefficients only, state
+// stays with the paired filter (matching the scalar set*()'s, which never
+// touch z1/z2 either -- coefficient rebuilds mid-stream carry state over).
+struct Biquad2 {
+    __m128d b0 = _mm_set1_pd(1.0), b1 = _mm_setzero_pd(), b2 = _mm_setzero_pd(),
+            a1 = _mm_setzero_pd(), a2 = _mm_setzero_pd(),
+            z1 = _mm_setzero_pd(), z2 = _mm_setzero_pd();
+    void pack(const Biquad& q0, const Biquad& q1) {   // coefficients only
+        b0 = _mm_set_pd(q1.b0, q0.b0); b1 = _mm_set_pd(q1.b1, q0.b1);
+        b2 = _mm_set_pd(q1.b2, q0.b2);
+        a1 = _mm_set_pd(q1.a1, q0.a1); a2 = _mm_set_pd(q1.a2, q0.a2);
+    }
+    inline __m128d process(__m128d x) {
+#if defined(__FMA__)
+        __m128d y = _mm_fmadd_pd(b0, x, z1);
+        z1 = _mm_add_pd(_mm_fmsub_pd(b1, x, _mm_mul_pd(a1, y)), z2);
+        z2 = _mm_fmsub_pd(b2, x, _mm_mul_pd(a2, y));
+#else
+        __m128d y = _mm_add_pd(_mm_mul_pd(b0, x), z1);
+        z1 = _mm_add_pd(_mm_sub_pd(_mm_mul_pd(b1, x), _mm_mul_pd(a1, y)), z2);
+        z2 = _mm_sub_pd(_mm_mul_pd(b2, x), _mm_mul_pd(a2, y));
+#endif
+        return y;
+    }
+    void reset() { z1 = z2 = _mm_setzero_pd(); }
+};
+
+// Paired one-pole lowpass; both lanes share one cutoff (shoulder, wall bus).
+struct OnePoleLP2 {
+    __m128d a = _mm_setzero_pd(), z = _mm_setzero_pd();
+    void setCutoff(double fs, double fc) {
+        if (fc > fs * 0.49) fc = fs * 0.49;
+        a = _mm_set1_pd(1.0 - std::exp(-2.0 * M_PI * fc / fs));
+    }
+    inline __m128d process(__m128d x) {
+#if defined(__FMA__)
+        z = _mm_fmadd_pd(a, _mm_sub_pd(x, z), z);
+#else
+        z = _mm_add_pd(z, _mm_mul_pd(a, _mm_sub_pd(x, z)));
+#endif
+        return z;
+    }
+    void reset() { z = _mm_setzero_pd(); }
+};
+
 // Brown-Duda HF shadow gain vs incidence angle: 2.0 (+6 dB) at the near ear
 // down to ~0.1 in the deepest shadow, with the slight antipodal "bright spot"
 // the sphere solution predicts.
@@ -265,6 +341,30 @@ struct HeadShadow {
         return y;
     }
     void reset() { x1 = y1 = 0; }
+};
+
+// Paired (L/R) head shadow; per-lane coefficients (the two ears see different
+// incidence angles), independent per-lane state.
+struct HeadShadow2 {
+    __m128d b0 = _mm_set1_pd(1.0), b1 = _mm_setzero_pd(), a1 = _mm_setzero_pd(),
+            x1 = _mm_setzero_pd(), y1 = _mm_setzero_pd();
+    void pack(const HeadShadow& L, const HeadShadow& R) {
+        b0 = _mm_set_pd(R.b0, L.b0);
+        b1 = _mm_set_pd(R.b1, L.b1);
+        a1 = _mm_set_pd(R.a1, L.a1);
+    }
+    inline __m128d process(__m128d x) {
+#if defined(__FMA__)
+        __m128d y = _mm_fnmadd_pd(a1, y1,
+                        _mm_fmadd_pd(b0, x, _mm_mul_pd(b1, x1)));
+#else
+        __m128d y = _mm_sub_pd(_mm_add_pd(_mm_mul_pd(b0, x), _mm_mul_pd(b1, x1)),
+                               _mm_mul_pd(a1, y1));
+#endif
+        x1 = x; y1 = y;
+        return y;
+    }
+    void reset() { x1 = y1 = _mm_setzero_pd(); }
 };
 
 // Power-of-two ring buffer, one per source. Sized for the longest room
@@ -412,8 +512,9 @@ struct SonicStormHP {
                                        // bar (in-band timing/interp error the
                                        // 2.8 kHz lowpass can't remove) for a CPU
                                        // saving negligible next to A1.
-    OnePoleLP  shlLP [kNumSrc][2];
-    HeadShadow shadow[kNumSrc][2];
+    OnePoleLP2  shl2  [kNumSrc];       // shoulder lowpass, both ears one update
+    HeadShadow  shadow[kNumSrc][2];    // coefficient holders (state in shadow2)
+    HeadShadow2 shadow2[kNumSrc];      // paired L/R head shadow
     Biquad     concha[kNumSrc][2];     // concha resonance peak
     Biquad     notch [kNumSrc][2];     // Batteau pinna-reflection notch (N1)
     Biquad     notch2[kNumSrc][2];     // second pinna notch N2 ~11 kHz (B2)
@@ -422,8 +523,13 @@ struct SonicStormHP {
 
     // A4: per source/ear, an ordered list of only the ACTIVE pinna biquads
     // (unity filters are skipped -- exact, since a unity biquad is identity).
+    // Membership depends only on frontness (a compile-time table), never on
+    // ear, knob, or coupling, so both ears' chains are always the same length
+    // in the same order -- which is what lets each rung pair into pin2 below,
+    // and why state alignment survives mid-stream rebuilds.
     Biquad*    pinChain[kNumSrc][2][5];
     int        pinN    [kNumSrc][2] = {{0}};
+    Biquad2    pin2    [kNumSrc][5];   // paired L/R pinna chain (state lives here)
 
     // A1: reflection bus. Per source/wall/ear an integer delay, and per
     // source/wall two precomputed weights: w0 = gain, w1 = gain*(alpha-1). All
@@ -433,8 +539,8 @@ struct SonicStormHP {
     int        reflDelay[kNumSrc][kNumRefl][2];
     double     reflW0   [kNumSrc][kNumRefl][2];   // gain
     double     reflW1   [kNumSrc][kNumRefl][2];   // gain*(alpha-1)
-    OnePoleLP  reflBusLP  [2];                     // shared wall lowpass, per ear
-    HeadShadow reflBusDiff[2];                     // shared HP1 (setDiff), per ear
+    OnePoleLP2  reflBusLP2;                        // shared wall lowpass, both ears
+    HeadShadow2 reflBusDiff2;                      // shared HP1 (setDiff), both ears
 
     // A9: exact-zero silence gating. Samples since each source last had a
     // nonzero input; a source sleeps once drained past gDrain.
@@ -449,8 +555,9 @@ struct SonicStormHP {
     // identical phase response, so correlated bass in the two paths sums
     // coherently at every frequency -- steep junk rejection with no notch.
     // The allpass is the same for both ears, so interaural cues are untouched.
-    Biquad lfeLP[2];
-    Biquad mainAP[2];      // [0] = L ear bus, [1] = R ear bus
+    Biquad  lfeLP[2];      // serial cascade of one channel -- stays scalar
+    Biquad  mainAPc;       // allpass coefficients (identical for both ears)
+    Biquad2 mainAP2;       // paired L/R mains allpass (state lives here)
     Smooth smSpace, smSurr, smCen, smLfe, smOut;
 
 #if defined(_WIN32)
@@ -491,8 +598,8 @@ struct SonicStormHP {
         rebuildModel();
         lfeLP[0].setLowpass(fs, 120.0, 0.7071);   // LR4 = two Q=0.7071 sections
         lfeLP[1].setLowpass(fs, 120.0, 0.7071);
-        mainAP[0].setAllpass(fs, 120.0, 0.7071);  // phase-match for the mains
-        mainAP[1].setAllpass(fs, 120.0, 0.7071);
+        mainAPc.setAllpass(fs, 120.0, 0.7071);    // phase-match for the mains
+        mainAP2.pack(mainAPc, mainAPc);
         smSpace.init(fs, 30.0, gSpace(params[P_SPACE]));
         smSurr.init (fs, 30.0, gSurr (params[P_SURR]));
         smCen.init  (fs, 30.0, gCenter(params[P_CENTER]));
@@ -519,9 +626,10 @@ struct SonicStormHP {
 
         const double earAz[2] = { -kEarAzDeg, +kEarAzDeg };
         // Shared reflection-bus filters: one wall lowpass + one shadow-diff (HP1)
-        // per ear, both independent of incidence angle (A1).
-        reflBusLP[0].setCutoff(fs, kWallLP);   reflBusLP[1].setCutoff(fs, kWallLP);
-        reflBusDiff[0].setDiff(fs, a);         reflBusDiff[1].setDiff(fs, a);
+        // for both ears (A1) -- coefficients are ear-independent, so both lanes
+        // carry the same values; only the state differs.
+        reflBusLP2.setCutoff(fs, kWallLP);
+        { HeadShadow d; d.setDiff(fs, a); reflBusDiff2.pack(d, d); }
         int maxRefl = 0;
 
         for (int s = 0; s < kNumSrc; ++s) {
@@ -537,9 +645,8 @@ struct SonicStormHP {
                 double dDir = kLatency + earDelaySec(a, thInc) * fs;
                 tapDir[s][e].set(dDir);
                 tapShl[s][e].set(dDir + kShoulderMs * 0.001 * fs);
-                shlLP[s][e].setCutoff(fs, kShoulderLP);
 
-                // Spherical-head shadow.
+                // Spherical-head shadow (per-ear coeffs -> packed after loop).
                 shadow[s][e].set(fs, a, thInc);
 
                 // --- structural pinna, voiced DIFFERENTIALLY for over-ear /
@@ -593,6 +700,15 @@ struct SonicStormHP {
                 pinN[s][e] = nc;
             }
 
+            // Pair the per-ear filters. Chain membership is ear-independent
+            // (both ears always built the same rungs above), so rung k of L
+            // and R pack together; pack() copies coefficients only, and the
+            // paired state carries across rebuilds exactly as scalar state did.
+            shl2[s].setCutoff(fs, kShoulderLP);
+            shadow2[s].pack(shadow[s][0], shadow[s][1]);
+            for (int k = 0; k < pinN[s][0]; ++k)
+                pin2[s][k].pack(*pinChain[s][0][k], *pinChain[s][1][k]);
+
             // --- image-source room reflections (4 first-order walls) ---
             // A1: instead of a per-path lowpass+shadow, store an integer delay
             // and two bus weights: w0 = gain, w1 = gain*(alpha-1). The shared
@@ -630,19 +746,18 @@ struct SonicStormHP {
     }
 
     void resetState() {
+        // Runtime state lives in the PAIRED filters; the scalar structs are
+        // coefficient holders only and carry no state worth clearing.
         for (int s = 0; s < kNumSrc; ++s) {
             ring[s].reset();
             silentFor[s] = gDrain + 1;      // start asleep until signal arrives
-            for (int e = 0; e < 2; ++e) {
-                shlLP[s][e].reset(); shadow[s][e].reset();
-                concha[s][e].reset(); notch[s][e].reset();
-                notch2[s][e].reset(); rearEQ[s][e].reset(); flange[s][e].reset();
-            }
+            shl2[s].reset();
+            shadow2[s].reset();
+            for (int k = 0; k < 5; ++k) pin2[s][k].reset();
         }
-        reflBusLP[0].reset(); reflBusLP[1].reset();
-        reflBusDiff[0].reset(); reflBusDiff[1].reset();
+        reflBusLP2.reset(); reflBusDiff2.reset();
         lfeLP[0].reset(); lfeLP[1].reset();
-        mainAP[0].reset(); mainAP[1].reset();
+        mainAP2.reset();
         reverb.reset();
     }
 
@@ -700,42 +815,65 @@ struct SonicStormHP {
             for (int s = 0; s < kNumSrc; ++s) {
                 if (!active[s]) continue;
                 bool diotic = (kSrcAz[s] == 0.0);   // A3: FC is L/R-identical
-                int eN = diotic ? 1 : 2;
 
-                for (int e = 0; e < eN; ++e) {
-                    // Direct + shoulder (both exact fractional taps), then the
-                    // active pinna chain.
-                    double x = tapDir[s][e].read(ring[s])
-                             + kShoulderGain * shlLP[s][e].process(tapShl[s][e].read(ring[s]));
-                    x = shadow[s][e].process(x);
-                    Biquad** ch = pinChain[s][e];
-                    for (int k = 0, kn = pinN[s][e]; k < kn; ++k) x = ch[k]->process(x);
+                // Direct + shoulder (both exact fractional taps), both ears in
+                // one paired update -- lane0 = L, lane1 = R. A diotic source
+                // reads its taps once and splats them into both lanes: both
+                // lanes then run identical arithmetic on identical state, so
+                // lane0 == lane1 == the old single-ear result, at the same
+                // per-sample cost as the old one-ear pass.
+                __m128d tdv, tsv;
+                if (diotic) {
+                    tdv = _mm_set1_pd(tapDir[s][0].read(ring[s]));
+                    tsv = _mm_set1_pd(tapShl[s][0].read(ring[s]));
+                } else {
+                    tdv = _mm_set_pd(tapDir[s][1].read(ring[s]),
+                                     tapDir[s][0].read(ring[s]));
+                    tsv = _mm_set_pd(tapShl[s][1].read(ring[s]),
+                                     tapShl[s][0].read(ring[s]));
+                }
+                __m128d xv = madd2(_mm_set1_pd(kShoulderGain),
+                                   shl2[s].process(tsv), tdv);
+                xv = shadow2[s].process(xv);
+                for (int k = 0, kn = pinN[s][0]; k < kn; ++k)
+                    xv = pin2[s][k].process(xv);
 
-                    // Room reflections -> per-ear bus (A1): accumulate plain and
-                    // alpha-weighted sums; the shared LP + shadow-diff below
-                    // reconstruct each path's exact shadow.
+                // Room reflections -> per-ear bus (A1): accumulate plain and
+                // alpha-weighted sums; the shared LP + shadow-diff below
+                // reconstruct each path's exact shadow. Ring reads stay
+                // per-ear scalar (different integer delays per lane).
+                if (diotic) {                     // add once to both ears (A3)
                     double b0 = 0, b1 = 0;
                     for (int r = 0; r < kNumRefl; ++r) {
-                        double v = ring[s].read(reflDelay[s][r][e]);
-                        b0 += reflW0[s][r][e] * v;
-                        b1 += reflW1[s][r][e] * v;
+                        double v = ring[s].read(reflDelay[s][r][0]);
+                        b0 += reflW0[s][r][0] * v;
+                        b1 += reflW1[s][r][0] * v;
                     }
-
-                    if (diotic) {                 // add once to both ears (A3)
-                        earL += x;    earR += x;
-                        bus0L += b0;  bus1L += b1;  bus0R += b0;  bus1R += b1;
-                    } else if (e == 0) {
-                        earL += x;    bus0L += b0;  bus1L += b1;
-                    } else {
-                        earR += x;    bus0R += b0;  bus1R += b1;
+                    double x = lane0(xv);
+                    earL += x;    earR += x;
+                    bus0L += b0;  bus1L += b1;  bus0R += b0;  bus1R += b1;
+                } else {
+                    double b0L = 0, b1L = 0, b0R = 0, b1R = 0;
+                    for (int r = 0; r < kNumRefl; ++r) {
+                        double vL = ring[s].read(reflDelay[s][r][0]);
+                        double vR = ring[s].read(reflDelay[s][r][1]);
+                        b0L += reflW0[s][r][0] * vL;  b1L += reflW1[s][r][0] * vL;
+                        b0R += reflW0[s][r][1] * vR;  b1R += reflW1[s][r][1] * vR;
                     }
+                    earL += lane0(xv);  bus0L += b0L;  bus1L += b1L;
+                    earR += lane1(xv);  bus0R += b0R;  bus1R += b1R;
                 }
             }
 
-            // A1: one lowpass + one shadow-diff per ear reconstruct the whole
-            // reflection stage: LP(bus0 + HP1(bus1)).
-            earL += 0.5 * space * reflBusLP[0].process(bus0L + reflBusDiff[0].process(bus1L));
-            earR += 0.5 * space * reflBusLP[1].process(bus0R + reflBusDiff[1].process(bus1R));
+            // A1: one lowpass + one shadow-diff reconstruct the whole
+            // reflection stage for both ears: LP(bus0 + HP1(bus1)).
+            {
+                __m128d busv = _mm_add_pd(_mm_set_pd(bus0R, bus0L),
+                                  reflBusDiff2.process(_mm_set_pd(bus1R, bus1L)));
+                busv = reflBusLP2.process(busv);
+                earL += 0.5 * space * lane0(busv);
+                earR += 0.5 * space * lane1(busv);
+            }
 
             // B1: opt-in late-diffuse tail, fed post-render and tied to Space^2
             // (Space=0 stays exactly anechoic). Added pre bass-management.
@@ -748,8 +886,11 @@ struct SonicStormHP {
 
             // Bass management: allpass the mains (phase match), LR4 the LFE,
             // then sum -- coherent at all frequencies. LFE is diotic.
-            earL = mainAP[0].process(earL);
-            earR = mainAP[1].process(earR);
+            {
+                __m128d earv = mainAP2.process(_mm_set_pd(earR, earL));
+                earL = lane0(earv);
+                earR = lane1(earv);
+            }
             double lfe = lfeG * lfeLP[1].process(lfeLP[0].process(
                             lfeIn ? (double)lfeIn[i] : 0.0));
             earL += 0.7071 * lfe;
