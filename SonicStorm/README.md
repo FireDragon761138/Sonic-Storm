@@ -1,15 +1,5 @@
-# SonicStorm ⚡ — 7.1 → 2.0 retro-90s 3D virtualizer (VST2, 64-bit) — EXPERIMENTAL
+# SonicStorm ⚡ — 7.1 → 2.0 retro-90s 3D virtualizer (VST2, 64-bit)
 
-> **Experimental build.** Identical sound to stock SonicStorm, plus a
-> **transparent stereo-detection** optimization: when the surround/center
-> channels are exactly silent (pure stereo on a 7.1 endpoint), the surround
-> path — the two rear-darkening filters and the surround mix — is skipped.
-> It is **bit-for-bit identical** to the reference (verified 0.0 difference,
-> including silence transitions), so it changes nothing you can hear. The
-> payoff is modest here (~5–18% on stereo content): SonicStorm is already very
-> light (a stereo-bus canceller, not per-source rendering), so there isn't much
-> per-channel work to skip. The technique is the same one that gives the
-> headphone build (SonicStorm HP) a ~4× stereo speedup, where it matters more.
 
 A lightweight surround-to-stereo virtualizer for **Equalizer APO**. It takes raw
 Windows **7.1** and folds it into a single stereo pair for **two real speakers**,
