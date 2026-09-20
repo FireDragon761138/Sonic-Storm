@@ -93,16 +93,30 @@ Needs WinLibs MinGW-w64 g++ on PATH (`winget install BrechtSanders.WinLibs.POSIX
 
 ```
 build_mingw.bat          REM -> SonicStormHP.dll
-g++ -O2 -o test_host.exe test_host.cpp && test_host.exe   REM optional self-test
+test_host.exe            REM self-test (built by the same script)
 ```
 
-Two binaries ship:
+**One binary.** `SonicStormHP.dll` carries two copies of the kernel — an x86-64
+baseline and an AVX2+FMA build — and picks between them once at load from CPUID.
+`SonicStormHP_AVX2.dll` is gone. The pair differed only in `-march`/`-mfma` yet
+both claimed uniqueID `'SShp'`, so a host that scanned both recalled whichever it
+happened to scan last.
 
-- **`SonicStormHP.dll`** — baseline x86-64 (SSE2); runs on any 64-bit CPU.
-- **`SonicStormHP_AVX2.dll`** — AVX2/FMA build for a 2013-or-newer CPU. Bit-for-bit
-  equivalent to the baseline (−181 dB apart, FMA rounding only); ~5–15% lighter,
-  mostly from FMA — the serial IIR chains don't vectorize wide. Use it if your
-  CPU supports AVX2; otherwise the baseline loses almost nothing.
+The SSE2 baseline is a supported path, not a formality: the x86-64 ABI mandates
+SSE2, so every 64-bit Windows machine from 7 through 11 runs the
+per-source-per-ear paired filters natively with no feature check.
+
+The paired primitives (`Biquad2`, `OnePoleLP2`, `HeadShadow2`) still carry the
+`__FMA__` branches they always had, and they needed no edits: a `#pragma GCC
+target` region sets `__FMA__` for code compiled inside it, so the same source now
+yields the plain mul/add form in the baseline kernel and the fused form in the
+AVX2 one. Previously that selection came from `-mfma` on the command line, which
+is what forced two binaries.
+
+The build greps the linked DLL for `vfmadd` and fails if it is absent — a target
+region only governs code compiled *inside* it, so a kernel that stops being
+inlined into the AVX2 wrapper silently degrades to a DLL that works, passes every
+test, and contains no AVX2 at all.
 
 The self-test verifies the actual psychoacoustics: ITD magnitude and direction,
 ILD, front/back spectral cue depth, Head-knob monotonicity, center symmetry,
@@ -122,16 +136,52 @@ silent. THD sits at the numerical floor (< −147 dB) below the soft-clip knee.
 Net: ~1.5× faster on a full 7.1 feed, ~4× on stereo content, with no audible
 change.
 
+### Cost and benefit of the single-DLL consolidation
+
+Measured with `bench_cmp.exe`, five **interleaved** pairs each (ns/frame, full 7.1
+feed; within-build spread 0.5–0.7):
+
+| Path | Old (two binaries) | New (one DLL) | |
+|---|---|---|---|
+| baseline / SSE2 | 240.5 | **216.0** | −10.2% |
+| AVX2 | 201.9 | 203.7 | +0.9% |
+
+The baseline gained because `-O3` now applies to the whole translation unit — the
+old split built only the AVX2 DLL at `-O3` and left the baseline at `-O2` — plus a
+`vec4` smoother bank (four of the five knob smoothers are independent one-poles
+sharing one coefficient, so they became a single wide update).
+
+The AVX2 path costs 0.9%, and it is worth being precise about why, because it is
+*not* the source changes. Compiling this same source whole-file with
+`-mavx2 -mfma` benches at 201.5 against the old DLL's 201.3 — indistinguishable.
+The 0.9% is the structural cost of runtime dispatch: a target region only makes
+the kernel and its inlined callees AVX2, whereas a dedicated build had the entire
+translation unit compiled that way. That is the trade for one binary, one
+uniqueID, and a 10% faster fallback.
+
+Transparency, across full 7.1, stereo-only and in-place, on all 8 output channels:
+
+| Comparison | Result |
+|---|---|
+| new baseline kernel vs old `-O2` build | **EXACT 0** — bit-identical |
+| new AVX2 kernel vs old `SonicStormHP_AVX2.dll` | 1 sample differs, 4.5e-13 (−247 dBFS) |
+| baseline kernel vs AVX2 kernel | 3 samples differ, 4.7e-10 (−187 dBFS) |
+
+The baseline result also confirms `-O2` → `-O3` does not perturb the arithmetic:
+GCC will not reassociate floating point without `-ffast-math`.
+
 ## Install (Equalizer APO)
 
 1. Set your playback device to **7.1** in Windows Sound settings.
-2. Copy `SonicStormHP.dll` to `C:\Utilities\EqualizerAPO\VSTPlugins\`
+2. Copy `SonicStormHP.dll` to your Equalizer APO `VSTPlugins\` folder
    (if already loaded, comment the `VSTPlugin:` line first — the DLL is
    file-locked while loaded).
 3. Add to `config.txt`:
    ```
    VSTPlugin: VSTPlugins\SonicStormHP.dll
    ```
+   Equalizer APO stores parameter values on that same line, so an existing chain
+   keeps its tuning across a DLL update as long as the parameter list is unchanged.
 4. Output appears on front L/R (= headphone L/R); other channels are silenced.
 
 Use **SonicStorm** (speaker version) for your desktop speakers; use **HP** for

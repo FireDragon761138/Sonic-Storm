@@ -84,6 +84,23 @@
 #define M_PI 3.14159265358979323846
 #endif
 
+// The per-sample chain must be inlined into whichever ISA wrapper calls it. A
+// GCC target region only governs code compiled INSIDE it, so anything left
+// out-of-line here gets emitted once at the x86-64 baseline and BOTH wrappers
+// merely call that copy: a DLL that works, passes every test, and contains no
+// AVX2 at all. build_mingw.bat greps the linked DLL for vfmadd to catch it.
+//
+// This also drives the __FMA__ branches in the paired primitives below. The
+// target pragma DOES set __FMA__ for code compiled inside the region (verified
+// on GCC 16.1), so the same primitive source yields the plain mul/add form in
+// the baseline kernel and the fused form in the AVX2 one -- which is exactly
+// what the old two-binary build achieved with -mfma on the command line.
+#if defined(__GNUC__)
+#define SSHP_HOT inline __attribute__((always_inline))
+#else
+#define SSHP_HOT inline
+#endif
+
 static const VstInt32 kNumParams = 9;
 enum { P_SPACE = 0, P_SURR = 1, P_CENTER = 2, P_LFE = 3, P_OUT = 4, P_HEAD = 5,
        P_MODE = 6, P_EAR = 7, P_REVERB = 8 };
@@ -157,7 +174,7 @@ struct OnePoleLP {
         if (fc > fs * 0.49) fc = fs * 0.49;
         a = 1.0 - std::exp(-2.0 * M_PI * fc / fs);
     }
-    inline double process(double x) { z += a * (x - z); return z; }
+    SSHP_HOT double process(double x) { z += a * (x - z); return z; }
     void reset() { z = 0.0; }
 };
 
@@ -220,7 +237,7 @@ struct Biquad {
         a1 = ( 2.0 * ((A - 1.0) - (A + 1.0) * cs)) / a0;
         a2 = (       (A + 1.0) - (A - 1.0) * cs - twoRootAalpha) / a0;
     }
-    inline double process(double x) {
+    SSHP_HOT double process(double x) {
         double y = b0 * x + z1;
         z1 = b1 * x - a1 * y + z2;
         z2 = b2 * x - a2 * y;
@@ -247,10 +264,10 @@ struct Biquad {
 //   shadow   y  = fnmadd(a1,y1, fmadd(b0,x, mul(b1,x1)))
 //   one-pole z  = fmadd(a, x-z, z)
 
-static inline double lane0(__m128d v) { return _mm_cvtsd_f64(v); }
-static inline double lane1(__m128d v) { return _mm_cvtsd_f64(_mm_unpackhi_pd(v, v)); }
+static SSHP_HOT double lane0(__m128d v) { return _mm_cvtsd_f64(v); }
+static SSHP_HOT double lane1(__m128d v) { return _mm_cvtsd_f64(_mm_unpackhi_pd(v, v)); }
 // a*b + c with the build's own contraction (used for the shoulder combine).
-static inline __m128d madd2(__m128d a, __m128d b, __m128d c) {
+static SSHP_HOT __m128d madd2(__m128d a, __m128d b, __m128d c) {
 #if defined(__FMA__)
     return _mm_fmadd_pd(a, b, c);
 #else
@@ -270,7 +287,7 @@ struct Biquad2 {
         b2 = _mm_set_pd(q1.b2, q0.b2);
         a1 = _mm_set_pd(q1.a1, q0.a1); a2 = _mm_set_pd(q1.a2, q0.a2);
     }
-    inline __m128d process(__m128d x) {
+    SSHP_HOT __m128d process(__m128d x) {
 #if defined(__FMA__)
         __m128d y = _mm_fmadd_pd(b0, x, z1);
         z1 = _mm_add_pd(_mm_fmsub_pd(b1, x, _mm_mul_pd(a1, y)), z2);
@@ -292,7 +309,7 @@ struct OnePoleLP2 {
         if (fc > fs * 0.49) fc = fs * 0.49;
         a = _mm_set1_pd(1.0 - std::exp(-2.0 * M_PI * fc / fs));
     }
-    inline __m128d process(__m128d x) {
+    SSHP_HOT __m128d process(__m128d x) {
 #if defined(__FMA__)
         z = _mm_fmadd_pd(a, _mm_sub_pd(x, z), z);
 #else
@@ -335,7 +352,7 @@ struct HeadShadow {
         b1 = -fs / den;
         a1 = (w0 - fs) / den;
     }
-    inline double process(double x) {
+    SSHP_HOT double process(double x) {
         double y = b0 * x + b1 * x1 - a1 * y1;
         x1 = x; y1 = y;
         return y;
@@ -353,7 +370,7 @@ struct HeadShadow2 {
         b1 = _mm_set_pd(R.b1, L.b1);
         a1 = _mm_set_pd(R.a1, L.a1);
     }
-    inline __m128d process(__m128d x) {
+    SSHP_HOT __m128d process(__m128d x) {
 #if defined(__FMA__)
         __m128d y = _mm_fnmadd_pd(a1, y1,
                         _mm_fmadd_pd(b0, x, _mm_mul_pd(b1, x1)));
@@ -376,8 +393,8 @@ struct SrcRing {
     double buf[SZ];
     int w = 0;
     void reset() { std::memset(buf, 0, sizeof buf); w = 0; }
-    inline void write(double v) { buf[w] = v; w = (w + 1) & MASK; }
-    inline double read(int d) const { return buf[(w - 1 - d) & MASK]; }
+    SSHP_HOT void write(double v) { buf[w] = v; w = (w + 1) & MASK; }
+    SSHP_HOT double read(int d) const { return buf[(w - 1 - d) & MASK]; }
 };
 
 // Precomputed windowed-sinc fractional-delay tap (exact for fixed positions).
@@ -387,7 +404,8 @@ struct FracTap {
     void set(double delaySamples) {
         double D = delaySamples;
         int D0 = (int)std::floor(D);
-        double f = D - D0;
+        // The fractional part needs no separate variable: arg below subtracts
+        // the full D, not D0, so the sinc is already centred on the fraction.
         base = D0 - (kSincTaps / 2 - 1);      // taps cover D0-3 .. D0+4
         if (base < 0) base = 0;               // (kLatency keeps this causal)
         double sum = 0;
@@ -405,7 +423,7 @@ struct FracTap {
         if (std::fabs(sum) > 1e-9)            // normalize for exact DC gain
             for (int j = 0; j < kSincTaps; ++j) wgt[j] /= sum;
     }
-    inline double read(const SrcRing& r) const {
+    SSHP_HOT double read(const SrcRing& r) const {
         double acc = 0;
         for (int j = 0; j < kSincTaps; ++j) acc += wgt[j] * r.read(base + j);
         return acc;
@@ -419,7 +437,34 @@ struct Smooth {
         coeff = std::exp(-1.0 / (fs * 0.001 * ms));
         v = start;
     }
-    inline double next(double target) { return v = target + coeff * (v - target); }
+    SSHP_HOT double next(double target) { return v = target + coeff * (v - target); }
+};
+
+// Gain smoother bank. The five knob smoothers are independent one-poles that all
+// share one 30 ms coefficient, so four of them run as a single wide update
+// instead of four scalar ones. The fifth (output trim) stays scalar rather than
+// padding a lane to no purpose.
+//
+// Declared with GCC's vector_size extension rather than an intrinsic on purpose:
+// the SAME source lowers to two SSE2 updates at the baseline and one AVX2 update
+// inside the target region, so there is no second version to keep in sync.
+//
+// Passed by reference, never by value: a 32-byte vector crossing a function
+// boundary without -mavx has a different ABI than with it (-Wpsabi). Everything
+// here is always_inline so no call survives, but keeping wide types out of the
+// signatures avoids the question entirely.
+typedef double vec4 __attribute__((vector_size(32)));
+
+struct Smooth4 {
+    vec4   v     = { 0, 0, 0, 0 };
+    double coeff = 0;
+    void init(double fs, double ms, const vec4& start) {
+        coeff = std::exp(-1.0 / (fs * 0.001 * ms));
+        v = start;
+    }
+    // Same arithmetic per lane as Smooth::next, so this stays bit-identical to
+    // the four scalar smoothers it replaces.
+    SSHP_HOT void next(const vec4& target) { v = target + coeff * (v - target); }
 };
 
 // Shared late-diffuse reverb tail (B1, opt-in). A small 4-line feedback delay
@@ -446,7 +491,7 @@ struct ReverbFDN {
         reset();   // buf is not zero-initialized at construction
     }
     void reset() { std::memset(buf, 0, sizeof buf); w = 0; for (auto& d : damp) d.reset(); }
-    inline void process(double in, double& outL, double& outR) {
+    SSHP_HOT void process(double in, double& outL, double& outR) {
         double d0 = buf[0][(w - len[0]) & MASK];
         double d1 = buf[1][(w - len[1]) & MASK];
         double d2 = buf[2][(w - len[2]) & MASK];
@@ -466,7 +511,7 @@ struct ReverbFDN {
 };
 
 // Soft clipper: linear below 0.8, smooth knee, ceiling 1.0.
-static inline double softclip(double x) {
+static SSHP_HOT double softclip(double x) {
     const double t = 0.8;
     double a = std::fabs(x);
     if (a <= t) return x;
@@ -558,7 +603,14 @@ struct SonicStormHP {
     Biquad  lfeLP[2];      // serial cascade of one channel -- stays scalar
     Biquad  mainAPc;       // allpass coefficients (identical for both ears)
     Biquad2 mainAP2;       // paired L/R mains allpass (state lives here)
-    Smooth smSpace, smSurr, smCen, smLfe, smOut;
+    Smooth4 smBus;         // {Space, Surround, Center, LFE} in four lanes
+    Smooth  smOut;         // output trim, scalar
+
+    // Current knob targets as a vector, so the bank update takes no shuffling.
+    SSHP_HOT void busTargets(vec4& t) const {
+        t = vec4{ gSpace (params[P_SPACE]),  gSurr(params[P_SURR]),
+                  gCenter(params[P_CENTER]), gLfe (params[P_LFE]) };
+    }
 
 #if defined(_WIN32)
     HWND edContainer = nullptr;
@@ -600,11 +652,9 @@ struct SonicStormHP {
         lfeLP[1].setLowpass(fs, 120.0, 0.7071);
         mainAPc.setAllpass(fs, 120.0, 0.7071);    // phase-match for the mains
         mainAP2.pack(mainAPc, mainAPc);
-        smSpace.init(fs, 30.0, gSpace(params[P_SPACE]));
-        smSurr.init (fs, 30.0, gSurr (params[P_SURR]));
-        smCen.init  (fs, 30.0, gCenter(params[P_CENTER]));
-        smLfe.init  (fs, 30.0, gLfe  (params[P_LFE]));
-        smOut.init  (fs, 30.0, gOut  (params[P_OUT]));
+        vec4 t0; busTargets(t0);
+        smBus.init(fs, 30.0, t0);
+        smOut.init(fs, 30.0, gOut(params[P_OUT]));
     }
 
     // Recompute every geometry-derived constant. Cheap (a few k flops); called
@@ -762,7 +812,7 @@ struct SonicStormHP {
     }
 
     template <typename T>
-    void run(T** in, T** out, VstInt32 n) {
+    SSHP_HOT void run(T** in, T** out, VstInt32 n) {
         // A2: flush denormals in hardware (covers every recursive state at once,
         // and lets silent channels reach EXACT zero so A9's gate can detect them
         // -- the old sign-flipped dither would have defeated that).
@@ -794,11 +844,11 @@ struct SonicStormHP {
         bool reverbActive = reverbOn(params[P_REVERB]);
 
         for (VstInt32 i = 0; i < n; ++i) {
-            double space = smSpace.next(gSpace(params[P_SPACE]));
-            double surr  = smSurr.next (gSurr (params[P_SURR]));
-            double cen   = smCen.next  (gCenter(params[P_CENTER]));
-            double lfeG  = smLfe.next  (gLfe  (params[P_LFE]));
-            double outG  = smOut.next  (gOut  (params[P_OUT]));
+            vec4 tgt; busTargets(tgt);
+            smBus.next(tgt);
+            double space = smBus.v[0], surr = smBus.v[1],
+                   cen   = smBus.v[2], lfeG = smBus.v[3];
+            double outG  = smOut.next(gOut(params[P_OUT]));
 
             // Write each ACTIVE source into its ring (knob gain applied at the
             // input so changes ride smoothly through all delayed taps). Sleeping
@@ -1095,11 +1145,55 @@ static float getParameter(AEffect* e, VstInt32 index) {
     SonicStormHP* p = (SonicStormHP*)e->object;
     return (index >= 0 && index < kNumParams) ? p->params[index] : 0.0f;
 }
+// ------------------------------------------------------------- ISA dispatch ----
+// One DLL, one kernel, emitted twice: once at the x86-64 baseline and once for
+// AVX2+FMA. Selected once at load from CPUID.
+//
+// This replaces the old two-binary build, where the AVX2 DLL was compiled with
+// -mavx2 -mfma on the command line so the paired primitives' __FMA__ branches
+// were selected by the preprocessor. The target pragma sets __FMA__ for code
+// inside the region, so those same branches are chosen per-kernel now, from one
+// source, with nothing to keep in sync.
+//
+// The SSE2 baseline remains a first-class path, not a formality: the x86-64 ABI
+// mandates SSE2, so every 64-bit Windows machine from 7 through 11 runs the
+// per-source-per-ear paired filters natively with no feature check.
+//
+// SSHP_FORCE_BASE / SSHP_FORCE_AVX2 exist only so the A/B harness can pin a
+// path. Neither is defined in a shipping build.
+static void runF_base(SonicStormHP* p, float**  i, float**  o, VstInt32 n) { p->run<float> (i, o, n); }
+static void runD_base(SonicStormHP* p, double** i, double** o, VstInt32 n) { p->run<double>(i, o, n); }
+
+#pragma GCC push_options
+#pragma GCC target("avx2,fma")
+static void runF_avx2(SonicStormHP* p, float**  i, float**  o, VstInt32 n) { p->run<float> (i, o, n); }
+static void runD_avx2(SonicStormHP* p, double** i, double** o, VstInt32 n) { p->run<double>(i, o, n); }
+#pragma GCC pop_options
+
+static void (*g_runF)(SonicStormHP*, float**,  float**,  VstInt32) = runF_base;
+static void (*g_runD)(SonicStormHP*, double**, double**, VstInt32) = runD_base;
+
+// Called from VSTPluginMain: host main thread, before any audio. Never CPUID
+// from the audio callback.
+static void initDispatch() {
+#if defined(SSHP_FORCE_BASE)
+    bool avx2 = false;
+#elif defined(SSHP_FORCE_AVX2)
+    bool avx2 = true;
+#else
+    __builtin_cpu_init();
+    // Nonzero bitmask on support, not 1.
+    bool avx2 = __builtin_cpu_supports("avx2") != 0 && __builtin_cpu_supports("fma") != 0;
+#endif
+    g_runF = avx2 ? runF_avx2 : runF_base;
+    g_runD = avx2 ? runD_avx2 : runD_base;
+}
+
 static void processReplacing(AEffect* e, float** in, float** out, VstInt32 n) {
-    ((SonicStormHP*)e->object)->run<float>(in, out, n);
+    g_runF((SonicStormHP*)e->object, in, out, n);
 }
 static void processDoubleReplacing(AEffect* e, double** in, double** out, VstInt32 n) {
-    ((SonicStormHP*)e->object)->run<double>(in, out, n);
+    g_runD((SonicStormHP*)e->object, in, out, n);
 }
 
 // Bounded copy: writes only the needed bytes + terminator (VST2 param strings
@@ -1193,7 +1287,7 @@ static VstIntPtr dispatcher(AEffect* e, VstInt32 opcode, VstInt32 index,
 
     case effGetEffectName:    copyStr(ptr, "SonicStorm HP", kMaxEffectName); return 1;
     case effGetProductString: copyStr(ptr, "SonicStorm HP 7.1->binaural", kMaxProductStr); return 1;
-    case effGetVendorString:  copyStr(ptr, "daede", kMaxVendorStr);   return 1;
+    case effGetVendorString:  copyStr(ptr, "FireDragon761138", kMaxVendorStr);   return 1;
     case effGetVendorVersion: return 1000;
     case effGetPlugCategory:  return kPlugCategEffect;
     case effGetVstVersion:    return 2400;
@@ -1216,6 +1310,7 @@ static VstIntPtr dispatcher(AEffect* e, VstInt32 opcode, VstInt32 index,
 #endif
 
 VST_EXPORT AEffect* VSTPluginMain(audioMasterCallback audioMaster) {
+    initDispatch();          // main thread, before any audio; idempotent
     SonicStormHP* p = new SonicStormHP();
     AEffect* e = &p->effect;
     std::memset(e, 0, sizeof(AEffect));
