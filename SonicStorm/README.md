@@ -1,6 +1,5 @@
 # SonicStorm ⚡ — 7.1 → 2.0 retro-90s 3D virtualizer (VST2, 64-bit)
 
-
 A lightweight surround-to-stereo virtualizer for **Equalizer APO**. It takes raw
 Windows **7.1** and folds it into a single stereo pair for **two real speakers**,
 recreating the classic 90s "3D audio" trick of throwing sounds *beside and
@@ -59,19 +58,82 @@ Needs WinLibs MinGW-w64 g++ on PATH (`winget install BrechtSanders.WinLibs.POSIX
 
 ```
 build_mingw.bat          REM -> SonicStorm.dll
-g++ -O2 -o test_host.exe test_host.cpp && test_host.exe   REM optional self-test
+test_host.exe            REM self-test (built by the same script)
 ```
 
-This experimental folder ships two binaries — `SonicStorm.dll` (baseline
-x86-64) and `SonicStorm_AVX2.dll` (AVX2/FMA, 2013+ CPUs) — plus
-`SonicStorm_ref.dll`, the stock build kept alongside for the transparency
-diff. All three sound identical; the AVX2 build is bit-equivalent to baseline.
+**One binary.** `SonicStorm.dll` carries two copies of the kernel — an x86-64
+baseline and an AVX2+FMA build — and picks between them once at load from CPUID.
+`SonicStorm_AVX2.dll` is gone; it forced an install-time choice and shared
+uniqueID `'SStm'` with the plain build, so a host that scanned both recalled
+whichever came last.
+
+The SSE2 baseline is a supported path, not a formality. The x86-64 ABI mandates
+SSE2, so every 64-bit Windows machine from 7 through 11 runs the lane-paired
+filters natively with no feature check and no scalar fallback to maintain. AVX2
+is the opportunistic upgrade on top.
+
+The build greps the linked DLL for `vfmadd` and fails if it is absent — a
+`#pragma GCC target` region only governs code compiled *inside* it, so a kernel
+that stops being inlined into the AVX2 wrapper silently degrades to a DLL that
+works, passes every test, and contains no AVX2 at all.
+
+## Performance
+
+~10.4 ns/frame, down from ~16.9. Measured with `bench_cmp.exe`, four reps each;
+no overlap between any adjacent pair of builds:
+
+| Build | ns/frame |
+|---|---|
+| old `SonicStorm.dll` (scalar x86-64) | 16.92 |
+| old `SonicStorm_AVX2.dll` (scalar + AVX2) | 16.28 |
+| new baseline kernel (SSE2, lane-paired) | 15.90 |
+| new AVX2 kernel (what this CPU selects) | 10.39 |
+
+**−38% against the binary this replaces.** Three changes got it there:
+
+1. **The unused-output silencing left the sample loop.** Channels 2–7 are zeroed
+   after the fold-down, and that ran *inside* the per-sample loop: six pointer
+   loads, six null checks and six stores on every sample, against roughly sixty
+   flops of actual DSP. It is now one `memset` per block. It has to sit *after*
+   the loop, not before — an in-place host aliases `out[c]` with `in[c]`, and the
+   loop still reads FC, LFE, BL, BR, SL and SR.
+2. **The L/R filter pairs run in SSE2 lanes.** The crossfeed bass-protect and
+   head-shadow one-poles, the rear-darkening one-poles, and the bass-management
+   allpass are all independent chains on identical coefficients — four paired
+   updates in place of eight scalar ones.
+3. **The knob smoothers run as one wide update.** Four of the five share a
+   coefficient and are mutually independent, so they became a single `vec4` bank
+   (GCC vector extension, so the same source is two SSE2 updates at baseline and
+   one AVX2 update inside the target region). Worth 7% on its own.
+
+Note what the AVX2 column did across that work: the *old* AVX2 build was only 4%
+faster than scalar, which is why an earlier pass recorded this loop as
+latency-bound and left it alone. That reading was measuring **scalar** code,
+where AVX2 can only supply VEX encodings — there was nothing to vectorise. Once
+the filters are lane-paired the `__FMA__` branches turn each one-pole into a
+single `vfmadd`, and the same CPU is now 35% faster than it was. "AVX2 doesn't
+help here" was never evidence that it would not help once the code was
+vectorised.
+
+Transparency, all three across full 7.1, stereo-only (the fast path) and
+in-place, comparing every one of the 8 output channels:
+
+| Comparison | Result |
+|---|---|
+| new baseline kernel vs old scalar build | **EXACT 0** — bit-identical |
+| baseline kernel vs AVX2 kernel | 3 samples differ, peak 5.8e-11 (−205 dBFS) |
+
+The lane-pairing is bit-exact, as it must be: every operation is element-wise, so
+lane 0 never reads lane 1 and there is no cross-lane mixing to disturb the image.
+The two ISA kernels differ only where FMA drops a rounding step, 85 dB below the
+audibility bar. Channels 2–7 verify as exactly silent in both out-of-place and
+in-place modes.
 
 ## Install (Equalizer APO)
 
 1. Set your **playback device to 7.1** in Windows Sound settings (so the 8
    channels actually exist for SonicStorm to receive).
-2. Copy `SonicStorm.dll` to `C:\Utilities\EqualizerAPO\VSTPlugins\`
+2. Copy `SonicStorm.dll` to your Equalizer APO `VSTPlugins\` folder
    (unload it first if it is already referenced — the DLL is file-locked while
    loaded; comment the `VSTPlugin:` line, copy, then re-add it).
 3. In `config.txt` (or via the Editor), add:

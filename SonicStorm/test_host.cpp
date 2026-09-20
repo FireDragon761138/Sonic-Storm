@@ -29,7 +29,7 @@ static double rms(const std::vector<float>& b, int from, int to) {
 int main() {
     HMODULE dll = LoadLibraryA("SonicStorm.dll");
     if (!dll) { printf("FAIL: cannot load SonicStorm.dll (err %lu)\n", GetLastError()); return 1; }
-    EntryProc entry = (EntryProc)GetProcAddress(dll, "VSTPluginMain");
+    EntryProc entry = (EntryProc)(void*)GetProcAddress(dll, "VSTPluginMain");
     if (!entry) { printf("FAIL: no VSTPluginMain export\n"); return 1; }
 
     AEffect* fx = entry(VSTCALLBACK_master);

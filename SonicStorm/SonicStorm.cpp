@@ -45,6 +45,17 @@
 #define M_PI 3.14159265358979323846
 #endif
 
+// The per-sample chain must be inlined into whichever ISA wrapper calls it. A
+// GCC target region only governs code compiled INSIDE it, so anything left
+// out-of-line here gets emitted once at the x86-64 baseline and BOTH wrappers
+// merely call that copy: a DLL that works, passes every test, and contains no
+// AVX2 at all. build_mingw.bat greps the linked DLL for vfmadd to catch it.
+#if defined(__GNUC__)
+#define SSTORM_HOT inline __attribute__((always_inline))
+#else
+#define SSTORM_HOT inline
+#endif
+
 static const VstInt32 kNumParams = 5;
 enum { P_WIDTH = 0, P_SURR = 1, P_CENTER = 2, P_LFE = 3, P_OUT = 4 };
 
@@ -60,7 +71,7 @@ struct OnePoleLP {
         if (fc > fs * 0.49) fc = fs * 0.49;
         a = 1.0 - std::exp(-2.0 * M_PI * fc / fs);
     }
-    inline double process(double x) { z += a * (x - z); return z; }
+    SSTORM_HOT double process(double x) { z += a * (x - z); return z; }
     void reset() { z = 0.0; }
 };
 
@@ -97,12 +108,69 @@ struct Biquad {
         a1 = (-2.0 * cs) / a0;
         a2 = (1.0 - alpha) / a0;
     }
-    inline double process(double x) {
+    SSTORM_HOT double process(double x) {
         double y = b0 * x + z1;
         z1 = b1 * x - a1 * y + z2;
         z2 = b2 * x - a2 * y;
         return y;
     }
+};
+
+// ---- lane-paired variants -----------------------------------------------
+// The L and R sides of the crossfeed, the rear darkening and the bass-management
+// allpass are INDEPENDENT chains carrying IDENTICAL coefficients, so each pair
+// runs as one SSE2 update instead of two scalar ones. Every operation is
+// element-wise -- lane 0 never reads lane 1 -- so there is no cross-lane mixing
+// to express and the stereo image is untouched by construction.
+//
+// SSE2 needs no feature check: the x86-64 ABI mandates it, so this is the
+// baseline path on every 64-bit Windows CPU. The FMA branches below are taken
+// only inside the AVX2 region (the target pragma sets __FMA__ for code compiled
+// there), and they mirror the association GCC picks when it contracts the scalar
+// filters, which is what keeps the two kernels agreeing.
+static SSTORM_HOT double lane0(__m128d v) { return _mm_cvtsd_f64(v); }
+static SSTORM_HOT double lane1(__m128d v) { return _mm_cvtsd_f64(_mm_unpackhi_pd(v, v)); }
+
+struct OnePoleLP2 {
+    __m128d a = _mm_setzero_pd(), z = _mm_setzero_pd();
+    void setCutoff(double fs, double fc) {
+        if (fc > fs * 0.49) fc = fs * 0.49;
+        a = _mm_set1_pd(1.0 - std::exp(-2.0 * M_PI * fc / fs));
+    }
+    SSTORM_HOT __m128d process(__m128d x) {
+#if defined(__FMA__)
+        z = _mm_fmadd_pd(a, _mm_sub_pd(x, z), z);
+#else
+        z = _mm_add_pd(z, _mm_mul_pd(a, _mm_sub_pd(x, z)));
+#endif
+        return z;
+    }
+    void reset() { z = _mm_setzero_pd(); }
+};
+
+// DF2T, both lanes on the same coefficients. Coefficients are still computed by
+// the scalar Biquad above (once, at setSampleRate) and broadcast in.
+struct Biquad2 {
+    __m128d b0 = _mm_set1_pd(1.0), b1 = _mm_setzero_pd(), b2 = _mm_setzero_pd(),
+            a1 = _mm_setzero_pd(), a2 = _mm_setzero_pd(),
+            z1 = _mm_setzero_pd(), z2 = _mm_setzero_pd();
+    void pack(const Biquad& q) {
+        b0 = _mm_set1_pd(q.b0); b1 = _mm_set1_pd(q.b1); b2 = _mm_set1_pd(q.b2);
+        a1 = _mm_set1_pd(q.a1); a2 = _mm_set1_pd(q.a2);
+    }
+    SSTORM_HOT __m128d process(__m128d x) {
+#if defined(__FMA__)
+        __m128d y = _mm_fmadd_pd(b0, x, z1);
+        z1 = _mm_add_pd(_mm_fmsub_pd(b1, x, _mm_mul_pd(a1, y)), z2);
+        z2 = _mm_fmsub_pd(b2, x, _mm_mul_pd(a2, y));
+#else
+        __m128d y = _mm_add_pd(_mm_mul_pd(b0, x), z1);
+        z1 = _mm_add_pd(_mm_sub_pd(_mm_mul_pd(b1, x), _mm_mul_pd(a1, y)), z2);
+        z2 = _mm_sub_pd(_mm_mul_pd(b2, x), _mm_mul_pd(a2, y));
+#endif
+        return y;
+    }
+    void reset() { z1 = z2 = _mm_setzero_pd(); }
 };
 
 // Power-of-two circular delay line (holds the canceller's fed-back outputs).
@@ -111,8 +179,8 @@ struct Delay {
     double buf[SZ];
     int w = 0;
     void reset() { std::memset(buf, 0, sizeof buf); w = 0; }
-    inline double read(int D) const { return buf[(w - D) & MASK]; }
-    inline void write(double v) { buf[w] = v; w = (w + 1) & MASK; }
+    SSTORM_HOT double read(int D) const { return buf[(w - D) & MASK]; }
+    SSTORM_HOT void write(double v) { buf[w] = v; w = (w + 1) & MASK; }
 };
 
 // One-pole smoother so knob moves don't zipper.
@@ -122,12 +190,38 @@ struct Smooth {
         coeff = std::exp(-1.0 / (fs * 0.001 * ms));
         v = start;
     }
-    inline double next(double target) { return v = target + coeff * (v - target); }
+    SSTORM_HOT double next(double target) { return v = target + coeff * (v - target); }
+};
+
+// Gain smoother bank. The five knob smoothers are independent one-poles that all
+// share a single coefficient, so four of them run as one wide update instead of
+// four scalar ones. The fifth (output trim) stays scalar rather than padding a
+// lane to no purpose.
+//
+// Declared with GCC's vector_size extension rather than an intrinsic on purpose:
+// the SAME source lowers to two SSE2 updates at the baseline and one AVX2 update
+// inside the target region, so there is no second version to keep in sync.
+typedef double vec4 __attribute__((vector_size(32)));
+
+// Passed and returned by reference, never by value: a 32-byte vector crossing a
+// function boundary without -mavx has a different ABI than with it, which GCC
+// warns about (-Wpsabi). Everything here is always_inline so no call survives,
+// but keeping wide types out of the signatures avoids the question entirely.
+struct Smooth4 {
+    vec4   v     = { 0, 0, 0, 0 };
+    double coeff = 0;
+    void init(double fs, double ms, const vec4& start) {
+        coeff = std::exp(-1.0 / (fs * 0.001 * ms));
+        v = start;
+    }
+    // Same arithmetic per lane as Smooth::next, so this stays bit-identical to
+    // the four scalar smoothers it replaces.
+    SSTORM_HOT void next(const vec4& target) { v = target + coeff * (v - target); }
 };
 
 // Soft clipper: perfectly linear below 0.8, smooth knee above, ceiling at 1.0.
 // Only engages on peaks, so normal-level audio is untouched.
-static inline double softclip(double x) {
+static SSTORM_HOT double softclip(double x) {
     const double t = 0.8;
     double a = std::fabs(x);
     if (a <= t) return x;
@@ -136,11 +230,11 @@ static inline double softclip(double x) {
 }
 
 // Knob (0..1) -> internal gains.
-static inline double gWidth (float p) { return 0.90 * (double)p; }   // crosstalk cancel gain
-static inline double gSurr  (float p) { return 1.40 * (double)p; }
-static inline double gCenter(float p) { return 1.40 * (double)p; }
-static inline double gLfe   (float p) { return 2.00 * (double)p; }
-static inline double gOut   (float p) { return 2.00 * (double)p; }   // 0.5 -> 1.0 (0 dB)
+static SSTORM_HOT double gWidth (float p) { return 0.90 * (double)p; }   // crosstalk cancel gain
+static SSTORM_HOT double gSurr  (float p) { return 1.40 * (double)p; }
+static SSTORM_HOT double gCenter(float p) { return 1.40 * (double)p; }
+static SSTORM_HOT double gLfe   (float p) { return 2.00 * (double)p; }
+static SSTORM_HOT double gOut   (float p) { return 2.00 * (double)p; }   // 0.5 -> 1.0 (0 dB)
 
 // Fixed fold-down headroom (-6 dB). Correlated bass across a full 7.1 feed
 // sums to ~+9 dB at default knobs (measured); without this the soft clipper
@@ -163,10 +257,10 @@ struct SonicStorm {
     static constexpr double kHeadShadow   = 6000.0; // contralateral high-freq rolloff
     static constexpr double kRearDarken   = 5500.0; // back channels sound duller (front/back cue)
 
-    Delay     ringL, ringR;            // fed-back canceller outputs
-    OnePoleLP xfBassL, xfBassR;        // bass-protect split in the crossfeed path
-    OnePoleLP xfShadowL, xfShadowR;    // head-shadow lowpass in the crossfeed path
-    OnePoleLP darkBL, darkBR;          // rear-channel darkening
+    Delay      ringL, ringR;           // fed-back canceller outputs
+    OnePoleLP2 xfBass2;                // bass-protect split, both sides in lanes
+    OnePoleLP2 xfShadow2;              // head-shadow lowpass, both sides in lanes
+    OnePoleLP2 darkB2;                 // rear-channel darkening, BL/BR in lanes
 
     // LFE path: proper bass management (same arrangement as SonicStorm HP).
     // Linkwitz-Riley 4th-order lowpass at 120 Hz (two cascaded Q=0.7071
@@ -175,12 +269,19 @@ struct SonicStorm {
     // the two paths sums coherently at every frequency -- steep junk rejection
     // with no crossover suckout. The allpass is identical for both channels,
     // so the canceller's stereo image is untouched.
-    Biquad lfeLP[2];
-    Biquad mainAP[2];      // [0] = L bus, [1] = R bus
+    Biquad  lfeLP[2];      // serial LR4 cascade on the mono LFE -- not pairable
+    Biquad2 mainAP2;       // L and R buses in the two lanes (identical coeffs)
 
-    Smooth smG, smSurr, smCen, smLfe, smOut;
+    Smooth4 smBus;         // {Width, Surround, Center, LFE} in four lanes
+    Smooth  smOut;         // output trim, scalar
 
-    // EXPERIMENTAL: transparent stereo detection. When BL/BR/SL/SR/FC are all
+    // Current knob targets as a vector, so the bank update takes no shuffling.
+    SSTORM_HOT void busTargets(vec4& t) const {
+        t = vec4{ gWidth (params[P_WIDTH]),  gSurr(params[P_SURR]),
+                  gCenter(params[P_CENTER]), gLfe (params[P_LFE]) };
+    }
+
+    // Transparent stereo detection. When BL/BR/SL/SR/FC are all
     // exactly zero (pure stereo content on a 7.1 endpoint) the surround/center
     // path -- the two rear-darkening one-poles and the surround mix -- produces
     // nothing, so we skip it. Exact-zero test only; a short drain window lets the
@@ -220,36 +321,32 @@ struct SonicStorm {
         if (D < 1) D = 1;
         if (D > Delay::SZ - 1) D = Delay::SZ - 1;
 
-        xfBassL.setCutoff(fs, kBassProtect);  xfBassR.setCutoff(fs, kBassProtect);
-        xfShadowL.setCutoff(fs, kHeadShadow); xfShadowR.setCutoff(fs, kHeadShadow);
-        darkBL.setCutoff(fs, kRearDarken);    darkBR.setCutoff(fs, kRearDarken);
+        xfBass2.setCutoff(fs, kBassProtect);
+        xfShadow2.setCutoff(fs, kHeadShadow);
+        darkB2.setCutoff(fs, kRearDarken);
         // Drain window: the rear-darkening one-poles (5.5 kHz) settle in a few
         // dozen samples; 12 ms is a generous, safe margin before we freeze them.
         gDrainSurr = (int)std::lround(fs * 0.012);
         lfeLP[0].setLowpass(fs, 120.0, 0.7071);   // LR4 = two Q=0.7071 sections
         lfeLP[1].setLowpass(fs, 120.0, 0.7071);
-        mainAP[0].setAllpass(fs, 120.0, 0.7071);  // phase-match for the mains
-        mainAP[1].setAllpass(fs, 120.0, 0.7071);
+        Biquad ap; ap.setAllpass(fs, 120.0, 0.7071);  // phase-match for the mains
+        mainAP2.pack(ap);                             // same coeffs in both lanes
 
-        smG.init  (fs, 30.0, gWidth (params[P_WIDTH]));
-        smSurr.init(fs, 30.0, gSurr (params[P_SURR]));
-        smCen.init (fs, 30.0, gCenter(params[P_CENTER]));
-        smLfe.init (fs, 30.0, gLfe  (params[P_LFE]));
-        smOut.init (fs, 30.0, gOut  (params[P_OUT]));
+        vec4 t0; busTargets(t0);
+        smBus.init(fs, 30.0, t0);
+        smOut.init(fs, 30.0, gOut(params[P_OUT]));
     }
 
     void resetState() {
         ringL.reset(); ringR.reset();
-        xfBassL.reset(); xfBassR.reset();
-        xfShadowL.reset(); xfShadowR.reset();
-        darkBL.reset(); darkBR.reset();
+        xfBass2.reset(); xfShadow2.reset(); darkB2.reset();
         surrSilent = gDrainSurr + 1;      // start in the fast path until surround arrives
         lfeLP[0].reset(); lfeLP[1].reset();
-        mainAP[0].reset(); mainAP[1].reset();
+        mainAP2.reset();
     }
 
     template <typename T>
-    void run(T** in, T** out, VstInt32 n) {
+    SSTORM_HOT void run(T** in, T** out, VstInt32 n) {
         // Flush subnormals to zero: the recursive canceller keeps recirculating
         // an exponentially decaying tail after the input goes silent, so its
         // delay lines and one-poles would otherwise sit in denormal range
@@ -262,7 +359,7 @@ struct SonicStorm {
             return in[c] ? (double)in[c][i] : 0.0;
         };
 
-        // EXPERIMENTAL stereo detection: does any surround/center channel carry a
+        // Stereo detection: does any surround/center channel carry a
         // nonzero sample this block? Exact-zero test only. If not (and the
         // darkening filters have drained), the fast path below skips the whole
         // surround/center mix -- bit-identically, since it would produce zero.
@@ -279,11 +376,11 @@ struct SonicStorm {
         for (VstInt32 i = 0; i < n; ++i) {
             // All smoothers advance every sample in both paths, so the canceller
             // state stays bit-identical to the never-gated version.
-            double g    = smG.next  (gWidth (params[P_WIDTH]));
-            double surr = smSurr.next(gSurr (params[P_SURR]));
-            double cen  = smCen.next (gCenter(params[P_CENTER]));
-            double lfe  = smLfe.next (gLfe  (params[P_LFE]));
-            double outG = smOut.next (gOut  (params[P_OUT]));
+            vec4 tgt; busTargets(tgt);
+            smBus.next(tgt);
+            double g    = smBus.v[0], surr = smBus.v[1],
+                   cen  = smBus.v[2], lfe  = smBus.v[3];
+            double outG = smOut.next(gOut(params[P_OUT]));
 
             double fl = rd(CH_FL, i),  fr = rd(CH_FR, i);
             double lf = rd(CH_LFE, i);
@@ -298,9 +395,13 @@ struct SonicStorm {
                 double fc = rd(CH_FC, i);
                 double bl = rd(CH_BL, i),  br = rd(CH_BR, i);
                 double sl = rd(CH_SL, i),  sr = rd(CH_SR, i);
-                // Rear channels are darkened (duller = "behind you" cue).
-                double bld = 0.4 * bl + 0.6 * darkBL.process(bl);
-                double brd = 0.4 * br + 0.6 * darkBR.process(br);
+                // Rear channels are darkened (duller = "behind you" cue). BL and
+                // BR are independent chains on identical coefficients -> one
+                // paired update. Lane 0 = BL, lane 1 = BR.
+                __m128d b  = _mm_set_pd(br, bl);
+                __m128d bd = _mm_add_pd(_mm_mul_pd(_mm_set1_pd(0.4), b),
+                                        _mm_mul_pd(_mm_set1_pd(0.6), darkB2.process(b)));
+                double bld = lane0(bd), brd = lane1(bd);
                 // Spatial bus: place each source in the stereo "ear" field.
                 // Fronts keep a little opposite-side bleed (0.30) so the canceller
                 // has something to widen; sides are fully lateral; backs mostly
@@ -315,36 +416,46 @@ struct SonicStorm {
             // (bass-protect highpass + head-shadow lowpass) so |crossfeed| <= 1,
             // then subtract it from the OPPOSITE channel. Using past outputs
             // (D >= 1) means no algebraic loop; g*|filter| < 1 => stable.
-            double dR = ringR.read(D), dL = ringL.read(D);
-            double hpR = dR - xfBassL.process(dR);     // bass-protected
-            double hpL = dL - xfBassR.process(dL);
-            double cfL = xfShadowL.process(hpR);       // head-shadow band-limit
-            double cfR = xfShadowR.process(hpL);
+            //
+            // The two sides are independent chains, so the whole band-limiting
+            // stage runs paired: lane 0 carries the side fed by the R ring, lane
+            // 1 the side fed by the L ring, exactly as the scalar code had it.
+            __m128d d  = _mm_set_pd(ringL.read(D), ringR.read(D));  // lane0=dR, lane1=dL
+            __m128d hp = _mm_sub_pd(d, xfBass2.process(d));         // bass-protected
+            __m128d cf = xfShadow2.process(hp);                     // head-shadow
 
-            double yL = busL - g * cfL;
-            double yR = busR - g * cfR;
-            ringL.write(yL); ringR.write(yR);
+            __m128d bus = _mm_set_pd(busR, busL);
+            __m128d y   = _mm_sub_pd(bus, _mm_mul_pd(_mm_set1_pd(g), cf));
+            ringL.write(lane0(y)); ringR.write(lane1(y));
 
             double mk = 1.0 / (1.0 + 0.4 * g);         // level makeup for the cancel
-            yL *= mk; yR *= mk;
+            y = _mm_mul_pd(y, _mm_set1_pd(mk));
 
             // ---- direct bus: center + LFE bypass the canceller ----
             // Bass management: allpass the mains (phase match), LR4 the LFE,
-            // then sum -- coherent at all frequencies.
+            // then sum -- coherent at all frequencies. The LFE cascade is mono
+            // and serial, so it stays scalar; the allpass pair does not.
             double lfeF = lfe * lfeLP[1].process(lfeLP[0].process(lf));
-            double busOutL = mainAP[0].process(yL + cenS);
-            double busOutR = mainAP[1].process(yR + cenS);
-            double oL = (busOutL + 0.7071 * lfeF) * kFoldHeadroom * outG;
-            double oR = (busOutR + 0.7071 * lfeF) * kFoldHeadroom * outG;
+            __m128d busOut = mainAP2.process(_mm_add_pd(y, _mm_set1_pd(cenS)));
+            __m128d o = _mm_mul_pd(
+                _mm_add_pd(busOut, _mm_set1_pd(0.7071 * lfeF)),
+                _mm_set1_pd(kFoldHeadroom * outG));
 
-            if (out[0]) out[0][i] = (T)softclip(oL);
-            if (out[1]) out[1][i] = (T)softclip(oR);
-
-            // We fold everything into the front pair; silence the rest so the
-            // surround speakers (if the device has them) don't double up.
-            for (int c = 2; c < effect.numOutputs; ++c)
-                if (out[c]) out[c][i] = (T)0;
+            if (out[0]) out[0][i] = (T)softclip(lane0(o));
+            if (out[1]) out[1][i] = (T)softclip(lane1(o));
         }
+
+        // We fold everything into the front pair; silence the rest so the
+        // surround speakers (if the device has them) don't double up.
+        //
+        // This used to run inside the sample loop -- six pointer loads, six null
+        // checks and six stores on EVERY sample, against roughly sixty flops of
+        // actual DSP. Once per block instead. It has to stay AFTER the loop, not
+        // before it: an in-place host aliases out[c] with in[c], and the loop
+        // still reads FC, LFE, BL, BR, SL and SR. Writing zero bytes gives +0.0
+        // for both float and double, so the result is bit-identical either way.
+        for (int c = 2; c < effect.numOutputs; ++c)
+            if (out[c]) std::memset(out[c], 0, (size_t)n * sizeof(T));
 
         // Advance the silence counter for blocks whose surround stayed quiet, so
         // the fast path engages only after the darkening filters have drained.
@@ -487,11 +598,50 @@ static float getParameter(AEffect* e, VstInt32 index) {
     SonicStorm* p = (SonicStorm*)e->object;
     return (index >= 0 && index < kNumParams) ? p->params[index] : 0.0f;
 }
+// ------------------------------------------------------------- ISA dispatch ----
+// One DLL, one kernel, emitted twice: once at the x86-64 baseline and once for
+// AVX2+FMA. Selected once at load from CPUID.
+//
+// The SSE2 baseline is a real, supported path, not a formality -- the x86-64 ABI
+// mandates SSE2, so every 64-bit Windows machine from 7 through 11 runs the
+// paired filters natively with no feature check. AVX2 is the opportunistic
+// upgrade on top of it.
+//
+// SSTORM_FORCE_BASE / SSTORM_FORCE_AVX2 exist only so the A/B harness can pin a
+// path. Neither is defined in a shipping build.
+static void runF_base(SonicStorm* p, float**  i, float**  o, VstInt32 n) { p->run<float> (i, o, n); }
+static void runD_base(SonicStorm* p, double** i, double** o, VstInt32 n) { p->run<double>(i, o, n); }
+
+#pragma GCC push_options
+#pragma GCC target("avx2,fma")
+static void runF_avx2(SonicStorm* p, float**  i, float**  o, VstInt32 n) { p->run<float> (i, o, n); }
+static void runD_avx2(SonicStorm* p, double** i, double** o, VstInt32 n) { p->run<double>(i, o, n); }
+#pragma GCC pop_options
+
+static void (*g_runF)(SonicStorm*, float**,  float**,  VstInt32) = runF_base;
+static void (*g_runD)(SonicStorm*, double**, double**, VstInt32) = runD_base;
+
+// Called from VSTPluginMain: host main thread, before any audio. Never CPUID
+// from the audio callback.
+static void initDispatch() {
+#if defined(SSTORM_FORCE_BASE)
+    bool avx2 = false;
+#elif defined(SSTORM_FORCE_AVX2)
+    bool avx2 = true;
+#else
+    __builtin_cpu_init();
+    // Nonzero bitmask on support, not 1.
+    bool avx2 = __builtin_cpu_supports("avx2") != 0 && __builtin_cpu_supports("fma") != 0;
+#endif
+    g_runF = avx2 ? runF_avx2 : runF_base;
+    g_runD = avx2 ? runD_avx2 : runD_base;
+}
+
 static void processReplacing(AEffect* e, float** in, float** out, VstInt32 n) {
-    ((SonicStorm*)e->object)->run<float>(in, out, n);
+    g_runF((SonicStorm*)e->object, in, out, n);
 }
 static void processDoubleReplacing(AEffect* e, double** in, double** out, VstInt32 n) {
-    ((SonicStorm*)e->object)->run<double>(in, out, n);
+    g_runD((SonicStorm*)e->object, in, out, n);
 }
 
 // Bounded copy that writes ONLY the needed bytes + terminator (never pads to
@@ -577,7 +727,7 @@ static VstIntPtr dispatcher(AEffect* e, VstInt32 opcode, VstInt32 index,
 
     case effGetEffectName:    copyStr(ptr, "SonicStorm", kMaxEffectName); return 1;
     case effGetProductString: copyStr(ptr, "SonicStorm 7.1->2", kMaxProductStr); return 1;
-    case effGetVendorString:  copyStr(ptr, "daede", kMaxVendorStr);   return 1;
+    case effGetVendorString:  copyStr(ptr, "FireDragon761138", kMaxVendorStr);   return 1;
     case effGetVendorVersion: return 1000;
     case effGetPlugCategory:  return kPlugCategEffect;
     case effGetVstVersion:    return 2400;
@@ -600,6 +750,7 @@ static VstIntPtr dispatcher(AEffect* e, VstInt32 opcode, VstInt32 index,
 #endif
 
 VST_EXPORT AEffect* VSTPluginMain(audioMasterCallback audioMaster) {
+    initDispatch();          // main thread, before any audio; idempotent
     SonicStorm* p = new SonicStorm();
     AEffect* e = &p->effect;
     std::memset(e, 0, sizeof(AEffect));
